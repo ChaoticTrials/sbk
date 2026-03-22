@@ -60,6 +60,10 @@ pub fn write_frame_dir(w: &mut impl Write, fd: &FrameDir) -> anyhow::Result<()> 
     Ok(())
 }
 
+/// Maximum number of frames per group we'll accept from an archive.
+/// 1 MiB frames × 1 M frames = 1 PiB of raw data, far beyond any real archive.
+const MAX_FRAMES_PER_GROUP: usize = 1_000_000;
+
 /// Read the Frame Directory from `r`.
 pub fn read_frame_dir(r: &mut impl Read) -> anyhow::Result<FrameDir> {
     let mut fd = FrameDir::new();
@@ -67,6 +71,14 @@ pub fn read_frame_dir(r: &mut impl Read) -> anyhow::Result<FrameDir> {
         let mut count_buf = [0u8; 4];
         r.read_exact(&mut count_buf)?;
         let count = u32::from_le_bytes(count_buf) as usize;
+        if count > MAX_FRAMES_PER_GROUP {
+            return Err(anyhow::anyhow!(
+                "frame count {} for group {} exceeds sanity limit {}",
+                count,
+                g,
+                MAX_FRAMES_PER_GROUP
+            ));
+        }
         fd.groups[g] = Vec::with_capacity(count);
         for _ in 0..count {
             let mut buf = [0u8; 20];

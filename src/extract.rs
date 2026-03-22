@@ -39,6 +39,26 @@ pub fn extract(
 
     // Match patterns
     let matched = find_patterns(&all_entries, patterns)?;
+
+    // Validate that no archive entry path escapes the output directory (path traversal guard).
+    for entry in &matched {
+        // Reject absolute paths and paths containing `..` components.
+        let p = std::path::Path::new(&entry.path);
+        if p.is_absolute() {
+            return Err(anyhow::anyhow!(
+                "archive entry has absolute path: {}",
+                entry.path
+            ));
+        }
+        for component in p.components() {
+            if component == std::path::Component::ParentDir {
+                return Err(anyhow::anyhow!(
+                    "archive entry path contains '..': {}",
+                    entry.path
+                ));
+            }
+        }
+    }
     if matched.is_empty() {
         if patterns.len() == 1 && patterns[0] != "**" {
             return Err(SbkError::NoMatch(patterns[0].clone()).into());
@@ -86,6 +106,17 @@ pub fn extract(
             ));
         }
         let entry = &group_frames[frame_idx as usize];
+        // Sanity-check compressed size before allocating (guards against corrupt/malicious archives).
+        // 256 MiB is a generous upper bound; real compressed frames are typically far smaller.
+        const MAX_COMPRESSED_FRAME: u32 = 256 * 1024 * 1024;
+        if entry.frame_compressed_sz > MAX_COMPRESSED_FRAME {
+            return Err(anyhow::anyhow!(
+                "frame ({},{}) compressed size {} exceeds sanity limit",
+                group_id,
+                frame_idx,
+                entry.frame_compressed_sz
+            ));
+        }
         let mut buf = vec![0u8; entry.frame_compressed_sz as usize];
         f.seek(SeekFrom::Start(entry.frame_offset))?;
         f.read_exact(&mut buf)?;
@@ -106,13 +137,33 @@ pub fn extract(
     bar_decomp2.set_style(bar_style.clone());
     bar_decomp2.set_prefix("XZ Decode    ");
 
+    // Build a lookup from (group_id, frame_idx) -> expected raw size for decompression cap.
+    let frame_raw_sz_map: HashMap<(u8, u32), u32> = unique_frames_vec
+        .iter()
+        .map(|&(group_id, frame_idx)| {
+            let entry = &frame_dir.groups[group_id as usize][frame_idx as usize];
+            ((group_id, frame_idx), entry.frame_raw_sz)
+        })
+        .collect();
+
     let decompressed_frames: HashMap<(u8, u32), Vec<u8>> = frame_data_map
         .par_iter()
         .map(|(&key, compressed)| {
             use std::io::Read as IoRead;
+            let expected_raw_sz = frame_raw_sz_map[&key] as usize;
             let mut dec = xz2::read::XzDecoder::new(&compressed[..]);
-            let mut raw = Vec::new();
-            dec.read_to_end(&mut raw)?;
+            // Pre-allocate to expected size and read exactly that many bytes,
+            // preventing decompression bombs from expanding beyond the declared frame size.
+            let mut raw = Vec::with_capacity(expected_raw_sz);
+            dec.by_ref().take(expected_raw_sz as u64 + 1).read_to_end(&mut raw)?;
+            if raw.len() > expected_raw_sz {
+                return Err(anyhow::anyhow!(
+                    "frame ({},{}) decompressed to more than declared {} bytes",
+                    key.0,
+                    key.1,
+                    expected_raw_sz
+                ));
+            }
             bar_decomp2.inc(1);
             Ok((key, raw))
         })

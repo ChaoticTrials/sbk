@@ -58,6 +58,9 @@ fn serialize_raw(entries: &[IndexEntry]) -> Vec<u8> {
     out
 }
 
+/// Maximum allowed compressed index size (256 MiB). Prevents OOM on corrupt headers.
+const MAX_INDEX_COMPRESSED_SIZE: u64 = 256 * 1024 * 1024;
+
 /// Read and decompress the index block.
 /// `compressed_size` bytes will be read from `r` (which should be positioned at the index start).
 pub fn read_index(
@@ -65,6 +68,13 @@ pub fn read_index(
     compressed_size: u64,
     expected_checksum: u32,
 ) -> anyhow::Result<Vec<IndexEntry>> {
+    if compressed_size > MAX_INDEX_COMPRESSED_SIZE {
+        return Err(anyhow::anyhow!(
+            "index compressed size {} exceeds sanity limit {}",
+            compressed_size,
+            MAX_INDEX_COMPRESSED_SIZE
+        ));
+    }
     let mut compressed = vec![0u8; compressed_size as usize];
     r.read_exact(&mut compressed)?;
 
@@ -83,11 +93,22 @@ pub fn read_index(
     parse_raw(&raw)
 }
 
+/// Maximum number of index entries we'll accept from an archive.
+/// A world with 100 million files would be pathological; this prevents OOM on corrupt data.
+const MAX_INDEX_ENTRIES: usize = 10_000_000;
+
 fn parse_raw(data: &[u8]) -> anyhow::Result<Vec<IndexEntry>> {
     if data.len() < 8 {
         return Err(anyhow::anyhow!("index data too short"));
     }
     let entry_count = u64::from_le_bytes(data[0..8].try_into().unwrap()) as usize;
+    if entry_count > MAX_INDEX_ENTRIES {
+        return Err(anyhow::anyhow!(
+            "index entry count {} exceeds sanity limit {}",
+            entry_count,
+            MAX_INDEX_ENTRIES
+        ));
+    }
     let mut entries = Vec::with_capacity(entry_count);
     let mut pos = 8;
 
