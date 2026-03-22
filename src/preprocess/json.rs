@@ -17,3 +17,41 @@ pub fn reconstruct_json(raw: &[u8], out_path: &Path) -> anyhow::Result<()> {
     std::fs::write(out_path, raw)?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn strips_whitespace() {
+        let result = preprocess_json_from_bytes(b"{  \"key\":  \"value\"  }").unwrap();
+        assert_eq!(result, b"{\"key\":\"value\"}");
+    }
+
+    #[test]
+    fn preserves_structure() {
+        let input = b"{\"a\": 1, \"b\": [1, 2, 3]}";
+        let result = preprocess_json_from_bytes(input).unwrap();
+        let orig: serde_json::Value = serde_json::from_slice(input).unwrap();
+        let processed: serde_json::Value = serde_json::from_slice(&result).unwrap();
+        assert_eq!(orig, processed);
+        // No spurious spaces in output
+        assert!(!result.contains(&b' '));
+    }
+
+    #[test]
+    fn invalid_json_errors() {
+        assert!(preprocess_json_from_bytes(b"not json {{{").is_err());
+        assert!(preprocess_json_from_bytes(b"").is_err());
+    }
+
+    #[test]
+    fn reconstruct_writes_bytes_verbatim() {
+        let dir = tempdir().unwrap();
+        let out = dir.path().join("data.json");
+        let data = b"{\"key\":\"value\"}";
+        reconstruct_json(data, &out).unwrap();
+        assert_eq!(std::fs::read(&out).unwrap(), data);
+    }
+}

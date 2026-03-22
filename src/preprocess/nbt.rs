@@ -26,3 +26,68 @@ pub fn reconstruct_nbt(raw: &[u8], out_path: &Path) -> anyhow::Result<()> {
     enc.finish()?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use flate2::write::GzEncoder;
+    use flate2::Compression;
+    use std::io::Write as IoWrite;
+    use tempfile::tempdir;
+
+    fn gzip(data: &[u8]) -> Vec<u8> {
+        let mut enc = GzEncoder::new(Vec::new(), Compression::new(6));
+        enc.write_all(data).unwrap();
+        enc.finish().unwrap()
+    }
+
+    #[test]
+    fn strips_gzip_wrapper() {
+        let raw = b"minimal nbt payload";
+        let result = preprocess_nbt_from_bytes(&gzip(raw)).unwrap();
+        assert_eq!(result, raw);
+    }
+
+    #[test]
+    fn invalid_input_errors() {
+        assert!(preprocess_nbt_from_bytes(b"not gzip at all").is_err());
+    }
+
+    #[test]
+    fn round_trip() {
+        use flate2::read::GzDecoder;
+        use std::io::Read;
+
+        let raw = b"some nbt compound data bytes";
+        let preprocessed = preprocess_nbt_from_bytes(&gzip(raw)).unwrap();
+        assert_eq!(preprocessed, raw);
+
+        let dir = tempdir().unwrap();
+        let out_path = dir.path().join("level.dat");
+        reconstruct_nbt(&preprocessed, &out_path).unwrap();
+
+        let mut dec = GzDecoder::new(std::fs::File::open(&out_path).unwrap());
+        let mut decoded = Vec::new();
+        dec.read_to_end(&mut decoded).unwrap();
+        assert_eq!(decoded, raw);
+    }
+
+    #[test]
+    fn empty_payload_round_trip() {
+        use flate2::read::GzDecoder;
+        use std::io::Read;
+
+        let raw = b"";
+        let preprocessed = preprocess_nbt_from_bytes(&gzip(raw)).unwrap();
+        assert_eq!(preprocessed, raw);
+
+        let dir = tempdir().unwrap();
+        let out_path = dir.path().join("empty.dat");
+        reconstruct_nbt(&preprocessed, &out_path).unwrap();
+
+        let mut dec = GzDecoder::new(std::fs::File::open(&out_path).unwrap());
+        let mut decoded = Vec::new();
+        dec.read_to_end(&mut decoded).unwrap();
+        assert_eq!(decoded, raw);
+    }
+}
