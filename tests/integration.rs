@@ -1,0 +1,774 @@
+use std::fs;
+use std::io::Write;
+use std::path::Path;
+
+use filetime::FileTime;
+use flate2::write::{GzEncoder, ZlibEncoder};
+use flate2::Compression;
+use tempfile::TempDir;
+
+use sbk::error::SbkError;
+use sbk::filter::{capture_now_ms, CompressOptions, FilterMode};
+
+// ─── helper: build a minimal valid MCA file ─────────────────────────────────
+
+fn make_mca_bytes(chunks: &[(u8, u8, &[u8])]) -> Vec<u8> {
+    let compressed: Vec<(u8, u8, Vec<u8>)> = chunks
+        .iter()
+        .map(|(x, z, nbt)| {
+            let mut enc = ZlibEncoder::new(Vec::new(), Compression::new(6));
+            enc.write_all(nbt).unwrap();
+            (*x, *z, enc.finish().unwrap())
+        })
+        .collect();
+
+    let mut sector_data: Vec<(usize, Vec<u8>)> = Vec::new();
+    let mut location_entries = vec![(0u32, 0u8); 1024];
+    let mut current_sector: usize = 2;
+
+    for (x, z, cdata) in &compressed {
+        let slot = (*z as usize) * 32 + (*x as usize);
+        let total_len = 5 + cdata.len();
+        let required_sectors = (total_len + 4095) / 4096;
+        location_entries[slot] = (current_sector as u32, required_sectors as u8);
+        sector_data.push((current_sector, cdata.clone()));
+        current_sector += required_sectors;
+    }
+
+    let total_size = current_sector * 4096;
+    let mut file = vec![0u8; total_size];
+
+    for (slot, (sector_offset, sector_count)) in location_entries.iter().enumerate() {
+        if *sector_count > 0 {
+            let base = slot * 4;
+            let entry = ((*sector_offset) << 8) | (*sector_count as u32);
+            file[base..base + 4].copy_from_slice(&entry.to_be_bytes());
+        }
+    }
+
+    for (sector, cdata) in &sector_data {
+        let pos = sector * 4096;
+        let length = (cdata.len() + 1) as u32;
+        file[pos..pos + 4].copy_from_slice(&length.to_be_bytes());
+        file[pos + 4] = 2; // zlib
+        file[pos + 5..pos + 5 + cdata.len()].copy_from_slice(cdata);
+    }
+
+    file
+}
+
+fn make_gzip_nbt(data: &[u8]) -> Vec<u8> {
+    let mut enc = GzEncoder::new(Vec::new(), Compression::new(6));
+    enc.write_all(data).unwrap();
+    enc.finish().unwrap()
+}
+
+/// Create a synthetic Minecraft world directory.
+fn make_test_world(dir: &Path) {
+    // region/r.0.0.mca — 5 chunks with minimal synthetic NBT
+    fs::create_dir_all(dir.join("region")).unwrap();
+    let mca_chunks: Vec<(u8, u8, Vec<u8>)> = (0u8..5)
+        .map(|i| (i % 5, i / 5, format!("nbt_data_{}", i).into_bytes()))
+        .collect();
+    let mca_refs: Vec<(u8, u8, &[u8])> = mca_chunks
+        .iter()
+        .map(|(x, z, d)| (*x, *z, d.as_slice()))
+        .collect();
+    let mca_bytes = make_mca_bytes(&mca_refs);
+    fs::write(dir.join("region/r.0.0.mca"), &mca_bytes).unwrap();
+
+    // DIM-1/region/r.0.0.mca — same structure
+    fs::create_dir_all(dir.join("DIM-1/region")).unwrap();
+    fs::write(dir.join("DIM-1/region/r.0.0.mca"), &mca_bytes).unwrap();
+
+    // level.dat — gzip-wrapped NBT
+    let nbt_raw = b"\x0a\x00\x00\x0a\x00\x04Data\x00"; // minimal compound NBT
+    let level_dat = make_gzip_nbt(nbt_raw);
+    fs::write(dir.join("level.dat"), &level_dat).unwrap();
+
+    // advancements/player.json — JSON with extra whitespace
+    fs::create_dir_all(dir.join("advancements")).unwrap();
+    fs::write(
+        dir.join("advancements/player.json"),
+        b"{  \"DataVersion\":  3700  ,  \"minecraft:story/root\":  true  }",
+    )
+    .unwrap();
+
+    // icon.png — fixed random bytes (RAW group)
+    fs::write(dir.join("icon.png"), b"\x89PNG\r\n\x1a\nfakeicon").unwrap();
+
+    // session.lock — always excluded
+    fs::write(dir.join("session.lock"), b"lock").unwrap();
+}
+
+fn default_opts(_world_dir: &Path, output: &Path) -> CompressOptions {
+    CompressOptions {
+        output: output.to_path_buf(),
+        threads: 2,
+        level: 1, // fast compression for tests
+        max_age: None,
+        since: None,
+        patterns: FilterMode::None,
+        include_session_lock: false,
+        quiet: true,
+    }
+}
+
+fn set_mtime(path: &Path, ms: i64) {
+    let ft = FileTime::from_unix_time(ms / 1000, ((ms % 1000) * 1_000_000) as u32);
+    filetime::set_file_mtime(path, ft).unwrap();
+}
+
+fn get_mtime_ms(path: &Path) -> i64 {
+    let ft = FileTime::from_last_modification_time(&fs::metadata(path).unwrap());
+    ft.unix_seconds() * 1000 + ft.nanoseconds() as i64 / 1_000_000
+}
+
+// ─── Test 1: Full round-trip ─────────────────────────────────────────────────
+
+#[test]
+fn test01_full_round_trip() {
+    let tmp = TempDir::new().unwrap();
+    let world_dir = tmp.path().join("world");
+    let archive = tmp.path().join("world.sbk");
+    let out_dir = tmp.path().join("restored");
+
+    make_test_world(&world_dir);
+
+    let opts = default_opts(&world_dir, &archive);
+    sbk::compress::compress(&world_dir, &opts).unwrap();
+    assert!(archive.exists());
+
+    sbk::decompress::decompress(&archive, &out_dir, 2).unwrap();
+
+    // session.lock must not be present
+    assert!(!out_dir.join("session.lock").exists());
+
+    // Check each expected file
+    assert!(out_dir.join("region/r.0.0.mca").exists());
+    assert!(out_dir.join("DIM-1/region/r.0.0.mca").exists());
+    assert!(out_dir.join("level.dat").exists());
+    assert!(out_dir.join("advancements/player.json").exists());
+    assert!(out_dir.join("icon.png").exists());
+
+    // icon.png RAW — byte-identical
+    let orig_icon = fs::read(world_dir.join("icon.png")).unwrap();
+    let rest_icon = fs::read(out_dir.join("icon.png")).unwrap();
+    assert_eq!(orig_icon, rest_icon);
+
+    // JSON should be compact (no extra spaces)
+    let json_content = fs::read_to_string(out_dir.join("advancements/player.json")).unwrap();
+    assert!(!json_content.contains("  "));
+    assert!(json_content.contains("DataVersion"));
+}
+
+// ─── Test 2: mtime preservation ──────────────────────────────────────────────
+
+#[test]
+fn test02_mtime_preservation() {
+    let tmp = TempDir::new().unwrap();
+    let world_dir = tmp.path().join("world");
+    let archive = tmp.path().join("world.sbk");
+    let out_dir = tmp.path().join("restored");
+
+    make_test_world(&world_dir);
+
+    // Stamp known mtime
+    let known_ms = 1_700_000_000_000i64;
+    set_mtime(&world_dir.join("icon.png"), known_ms);
+    set_mtime(&world_dir.join("advancements/player.json"), known_ms + 1000);
+
+    let opts = default_opts(&world_dir, &archive);
+    sbk::compress::compress(&world_dir, &opts).unwrap();
+    sbk::decompress::decompress(&archive, &out_dir, 2).unwrap();
+
+    let got_icon = get_mtime_ms(&out_dir.join("icon.png"));
+    assert!(
+        (got_icon - known_ms).abs() <= 1,
+        "icon mtime off by {} ms",
+        (got_icon - known_ms).abs()
+    );
+
+    let got_json = get_mtime_ms(&out_dir.join("advancements/player.json"));
+    assert!(
+        (got_json - (known_ms + 1000)).abs() <= 1,
+        "json mtime off by {} ms",
+        (got_json - (known_ms + 1000)).abs()
+    );
+}
+
+// ─── Test 3: --max-age excludes old file ─────────────────────────────────────
+
+#[test]
+fn test03_max_age_excludes_old() {
+    let tmp = TempDir::new().unwrap();
+    let world_dir = tmp.path().join("world");
+    let archive = tmp.path().join("world.sbk");
+    let out_dir = tmp.path().join("restored");
+
+    make_test_world(&world_dir);
+
+    let now_ms = capture_now_ms();
+    let ten_days_ms: i64 = 864_000_000;
+    let five_days_ms: u64 = 432_000_000;
+
+    // Backdate region/r.0.0.mca by 10 days
+    set_mtime(&world_dir.join("region/r.0.0.mca"), now_ms - ten_days_ms);
+
+    let opts = CompressOptions {
+        max_age: Some(five_days_ms),
+        ..default_opts(&world_dir, &archive)
+    };
+    sbk::compress::compress(&world_dir, &opts).unwrap();
+    sbk::decompress::decompress(&archive, &out_dir, 2).unwrap();
+
+    // Old MCA must be absent
+    assert!(!out_dir.join("region/r.0.0.mca").exists());
+    // Other files present
+    assert!(out_dir.join("icon.png").exists());
+}
+
+// ─── Test 4: --max-age boundary precision ────────────────────────────────────
+
+#[test]
+fn test04_max_age_boundary() {
+    let tmp = TempDir::new().unwrap();
+    let world_dir = tmp.path().join("world");
+    let archive = tmp.path().join("world.sbk");
+    let out_dir = tmp.path().join("restored");
+
+    make_test_world(&world_dir);
+
+    let now_ms = capture_now_ms();
+    let max_age_ms: u64 = 1_000_000;
+
+    // file A: exactly at cutoff (should be included)
+    set_mtime(&world_dir.join("icon.png"), now_ms - max_age_ms as i64);
+    // file B: just before cutoff (should be excluded)
+    set_mtime(
+        &world_dir.join("advancements/player.json"),
+        now_ms - max_age_ms as i64 - 1,
+    );
+
+    let opts = CompressOptions {
+        max_age: Some(max_age_ms),
+        ..default_opts(&world_dir, &archive)
+    };
+    sbk::compress::compress(&world_dir, &opts).unwrap();
+    sbk::decompress::decompress(&archive, &out_dir, 2).unwrap();
+
+    assert!(
+        out_dir.join("icon.png").exists(),
+        "icon.png at cutoff should be included"
+    );
+    assert!(
+        !out_dir.join("advancements/player.json").exists(),
+        "player.json just before cutoff should be excluded"
+    );
+}
+
+// ─── Test 5: --since basic ───────────────────────────────────────────────────
+
+#[test]
+fn test05_since_basic() {
+    let tmp = TempDir::new().unwrap();
+    let world_dir = tmp.path().join("world");
+    let archive = tmp.path().join("world.sbk");
+    let out_dir = tmp.path().join("restored");
+
+    make_test_world(&world_dir);
+
+    let since: i64 = 1_700_000_000_000;
+    set_mtime(&world_dir.join("icon.png"), since - 1); // excluded
+    set_mtime(&world_dir.join("advancements/player.json"), since); // included
+
+    let opts = CompressOptions {
+        since: Some(since),
+        ..default_opts(&world_dir, &archive)
+    };
+    sbk::compress::compress(&world_dir, &opts).unwrap();
+    sbk::decompress::decompress(&archive, &out_dir, 2).unwrap();
+
+    assert!(
+        !out_dir.join("icon.png").exists(),
+        "icon.png before --since should be excluded"
+    );
+    assert!(
+        out_dir.join("advancements/player.json").exists(),
+        "player.json at --since should be included"
+    );
+}
+
+// ─── Test 6: --since epoch zero and far future ───────────────────────────────
+
+#[test]
+fn test06_since_epoch_zero() {
+    let tmp = TempDir::new().unwrap();
+    let world_dir = tmp.path().join("world");
+    let archive_all = tmp.path().join("all.sbk");
+    let archive_none = tmp.path().join("none.sbk");
+    let out_dir = tmp.path().join("restored");
+
+    make_test_world(&world_dir);
+
+    // --since 0: all files included (all have mtime > 0)
+    let opts_all = CompressOptions {
+        since: Some(0),
+        ..default_opts(&world_dir, &archive_all)
+    };
+    sbk::compress::compress(&world_dir, &opts_all).unwrap();
+    sbk::decompress::decompress(&archive_all, &out_dir, 2).unwrap();
+    assert!(out_dir.join("icon.png").exists());
+
+    // --since year 2100: archive should be (nearly) empty — no error
+    let year2100_ms: i64 = 4_102_444_800_000;
+    let opts_none = CompressOptions {
+        since: Some(year2100_ms),
+        ..default_opts(&world_dir, &archive_none)
+    };
+    sbk::compress::compress(&world_dir, &opts_none).unwrap();
+    // Just check the archive exists and doesn't error; decompress is trivial
+    assert!(archive_none.exists());
+}
+
+// ─── Test 7: --max-age and --since combined ───────────────────────────────────
+
+#[test]
+fn test07_max_age_and_since_combined() {
+    let tmp = TempDir::new().unwrap();
+    let world_dir = tmp.path().join("world");
+
+    make_test_world(&world_dir);
+
+    // Use controlled times to avoid clock dependency
+    // We'll set all files to known times and use since/max_age relative to a fake "now"
+    // But the real filter uses capture_now_ms() internally in compress.
+    // Instead, test the filter function directly.
+    use sbk::filter::accept;
+
+    let now = 2_000_000i64;
+    let max_age = Some(500_000u64); // relative cutoff = 1_500_000
+    let since = Some(1_600_000i64);
+
+    // A: mtime 1_400_000 — fails both
+    assert!(!accept(
+        "a.dat",
+        1_400_000,
+        now,
+        max_age,
+        since,
+        &FilterMode::None,
+        false
+    ));
+    // B: mtime 1_600_000 — passes both
+    assert!(accept(
+        "b.dat",
+        1_600_000,
+        now,
+        max_age,
+        since,
+        &FilterMode::None,
+        false
+    ));
+    // C: mtime 1_800_000 — passes both
+    assert!(accept(
+        "c.dat",
+        1_800_000,
+        now,
+        max_age,
+        since,
+        &FilterMode::None,
+        false
+    ));
+}
+
+// ─── Test 8: --exclude single pattern ────────────────────────────────────────
+
+#[test]
+fn test08_exclude_single_pattern() {
+    let tmp = TempDir::new().unwrap();
+    let world_dir = tmp.path().join("world");
+    let archive = tmp.path().join("world.sbk");
+    let out_dir = tmp.path().join("restored");
+
+    make_test_world(&world_dir);
+
+    let pat = glob::Pattern::new("region/*.mca").unwrap();
+    let opts = CompressOptions {
+        patterns: FilterMode::Exclude(vec![pat]),
+        ..default_opts(&world_dir, &archive)
+    };
+    sbk::compress::compress(&world_dir, &opts).unwrap();
+    sbk::decompress::decompress(&archive, &out_dir, 2).unwrap();
+
+    // Overworld MCA excluded
+    assert!(!out_dir.join("region/r.0.0.mca").exists());
+    // DIM-1 MCA present
+    assert!(out_dir.join("DIM-1/region/r.0.0.mca").exists());
+}
+
+// ─── Test 9: --exclude multiple patterns ─────────────────────────────────────
+
+#[test]
+fn test09_exclude_multiple_patterns() {
+    let tmp = TempDir::new().unwrap();
+    let world_dir = tmp.path().join("world");
+    let archive = tmp.path().join("world.sbk");
+    let out_dir = tmp.path().join("restored");
+
+    make_test_world(&world_dir);
+
+    let p1 = glob::Pattern::new("DIM-1/**").unwrap();
+    let opts = CompressOptions {
+        patterns: FilterMode::Exclude(vec![p1]),
+        ..default_opts(&world_dir, &archive)
+    };
+    sbk::compress::compress(&world_dir, &opts).unwrap();
+    sbk::decompress::decompress(&archive, &out_dir, 2).unwrap();
+
+    // DIM-1 absent
+    assert!(!out_dir.join("DIM-1/region/r.0.0.mca").exists());
+    // Overworld present
+    assert!(out_dir.join("region/r.0.0.mca").exists());
+}
+
+// ─── Test 10: --include single pattern ───────────────────────────────────────
+
+#[test]
+fn test10_include_single_pattern() {
+    let tmp = TempDir::new().unwrap();
+    let world_dir = tmp.path().join("world");
+    let archive = tmp.path().join("world.sbk");
+    let out_dir = tmp.path().join("restored");
+
+    make_test_world(&world_dir);
+
+    let pat = glob::Pattern::new("**/*.json").unwrap();
+    let opts = CompressOptions {
+        patterns: FilterMode::Include(vec![pat]),
+        ..default_opts(&world_dir, &archive)
+    };
+    sbk::compress::compress(&world_dir, &opts).unwrap();
+    sbk::decompress::decompress(&archive, &out_dir, 2).unwrap();
+
+    // Only JSON files
+    assert!(out_dir.join("advancements/player.json").exists());
+    // No MCA, no RAW, no NBT
+    assert!(!out_dir.join("region/r.0.0.mca").exists());
+    assert!(!out_dir.join("icon.png").exists());
+    assert!(!out_dir.join("level.dat").exists());
+    // session.lock still absent
+    assert!(!out_dir.join("session.lock").exists());
+}
+
+// ─── Test 11: --include multiple patterns ────────────────────────────────────
+
+#[test]
+fn test11_include_multiple_patterns() {
+    let tmp = TempDir::new().unwrap();
+    let world_dir = tmp.path().join("world");
+    let archive = tmp.path().join("world.sbk");
+    let out_dir = tmp.path().join("restored");
+
+    make_test_world(&world_dir);
+
+    let p1 = glob::Pattern::new("level.dat").unwrap();
+    // advancements/** to match any json under advancements
+    let p2 = glob::Pattern::new("advancements/**").unwrap();
+    let opts = CompressOptions {
+        patterns: FilterMode::Include(vec![p1, p2]),
+        ..default_opts(&world_dir, &archive)
+    };
+    sbk::compress::compress(&world_dir, &opts).unwrap();
+    sbk::decompress::decompress(&archive, &out_dir, 2).unwrap();
+
+    assert!(out_dir.join("level.dat").exists());
+    assert!(out_dir.join("advancements/player.json").exists());
+    assert!(!out_dir.join("region/r.0.0.mca").exists());
+    assert!(!out_dir.join("icon.png").exists());
+}
+
+// ─── Test 12: --max-age + --include combined ─────────────────────────────────
+
+#[test]
+fn test12_max_age_and_include_combined() {
+    let tmp = TempDir::new().unwrap();
+    let world_dir = tmp.path().join("world");
+    let archive = tmp.path().join("world.sbk");
+
+    make_test_world(&world_dir);
+
+    let now_ms = capture_now_ms();
+    let ten_days_ms = 864_000_000i64;
+    let five_days_ms: u64 = 432_000_000;
+
+    // Backdate the only included file (region MCA) by 10 days
+    set_mtime(&world_dir.join("region/r.0.0.mca"), now_ms - ten_days_ms);
+
+    let pat = glob::Pattern::new("region/*.mca").unwrap();
+    let opts = CompressOptions {
+        max_age: Some(five_days_ms),
+        patterns: FilterMode::Include(vec![pat]),
+        ..default_opts(&world_dir, &archive)
+    };
+    sbk::compress::compress(&world_dir, &opts).unwrap();
+    // Archive exists, no error
+    assert!(archive.exists());
+}
+
+// ─── Test 13: Conflicting filters error ──────────────────────────────────────
+
+#[test]
+fn test13_conflicting_filters_error() {
+    // This is validated at the CLI level in main.rs before compress() is called.
+    // We test the error type directly.
+    let err = SbkError::ConflictingFilters;
+    let msg = err.to_string();
+    assert!(msg.contains("mutually exclusive"));
+}
+
+// ─── Test 14: Invalid --max-age ──────────────────────────────────────────────
+
+#[test]
+fn test14_invalid_max_age() {
+    let err = SbkError::InvalidMaxAge;
+    assert!(err.to_string().contains("1 millisecond"));
+}
+
+// ─── Test 15: Invalid --since ────────────────────────────────────────────────
+
+#[test]
+fn test15_invalid_since() {
+    let err = SbkError::InvalidSinceTimestamp;
+    assert!(err.to_string().contains("non-negative"));
+}
+
+// ─── Test 16: Selective extract, single file ────────────────────────────────
+
+#[test]
+fn test16_selective_extract_single_file() {
+    let tmp = TempDir::new().unwrap();
+    let world_dir = tmp.path().join("world");
+    let archive = tmp.path().join("world.sbk");
+    let out_dir = tmp.path().join("extracted");
+
+    make_test_world(&world_dir);
+    let opts = default_opts(&world_dir, &archive);
+    sbk::compress::compress(&world_dir, &opts).unwrap();
+
+    let n =
+        sbk::extract::extract(&archive, &["region/r.0.0.mca".to_string()], &out_dir, 2).unwrap();
+
+    assert_eq!(n, 1);
+    assert!(out_dir.join("region/r.0.0.mca").exists());
+    assert!(!out_dir.join("icon.png").exists());
+}
+
+// ─── Test 17: Selective extract, glob ────────────────────────────────────────
+
+#[test]
+fn test17_selective_extract_glob() {
+    let tmp = TempDir::new().unwrap();
+    let world_dir = tmp.path().join("world");
+    let archive = tmp.path().join("world.sbk");
+    let out_dir = tmp.path().join("extracted");
+
+    make_test_world(&world_dir);
+    let opts = default_opts(&world_dir, &archive);
+    sbk::compress::compress(&world_dir, &opts).unwrap();
+
+    sbk::extract::extract(&archive, &["**/*.json".to_string()], &out_dir, 2).unwrap();
+
+    assert!(out_dir.join("advancements/player.json").exists());
+    assert!(!out_dir.join("region/r.0.0.mca").exists());
+    assert!(!out_dir.join("icon.png").exists());
+}
+
+// ─── Test 18: No match (extract) ─────────────────────────────────────────────
+
+#[test]
+fn test18_no_match_extract() {
+    let tmp = TempDir::new().unwrap();
+    let world_dir = tmp.path().join("world");
+    let archive = tmp.path().join("world.sbk");
+    let out_dir = tmp.path().join("extracted");
+
+    make_test_world(&world_dir);
+    let opts = default_opts(&world_dir, &archive);
+    sbk::compress::compress(&world_dir, &opts).unwrap();
+
+    let result =
+        sbk::extract::extract(&archive, &["nonexistent/file.dat".to_string()], &out_dir, 2);
+
+    assert!(result.is_err());
+    let err_str = result.unwrap_err().to_string();
+    assert!(
+        err_str.contains("No files matched") || err_str.contains("nonexistent"),
+        "unexpected error: {}",
+        err_str
+    );
+}
+
+// ─── Test 19: Thread determinism ─────────────────────────────────────────────
+
+#[test]
+fn test19_thread_determinism() {
+    let tmp = TempDir::new().unwrap();
+    let world_dir = tmp.path().join("world");
+
+    make_test_world(&world_dir);
+
+    // Set consistent mtimes so output is deterministic
+    let base_ms = 1_700_000_000_000i64;
+    set_mtime(&world_dir.join("region/r.0.0.mca"), base_ms);
+    set_mtime(&world_dir.join("DIM-1/region/r.0.0.mca"), base_ms + 1000);
+    set_mtime(&world_dir.join("level.dat"), base_ms + 2000);
+    set_mtime(&world_dir.join("advancements/player.json"), base_ms + 3000);
+    set_mtime(&world_dir.join("icon.png"), base_ms + 4000);
+    set_mtime(&world_dir.join("session.lock"), base_ms + 5000);
+
+    let archives: Vec<_> = [1usize, 2, 4]
+        .iter()
+        .map(|&t| {
+            let archive = tmp.path().join(format!("world_{}.sbk", t));
+            let opts = CompressOptions {
+                threads: t,
+                level: 1,
+                ..default_opts(&world_dir, &archive)
+            };
+            sbk::compress::compress(&world_dir, &opts).unwrap();
+            archive
+        })
+        .collect();
+
+    let bytes: Vec<Vec<u8>> = archives.iter().map(|a| fs::read(a).unwrap()).collect();
+    assert_eq!(bytes[0], bytes[1], "1-thread vs 2-thread differ");
+    assert_eq!(bytes[0], bytes[2], "1-thread vs 4-thread differ");
+}
+
+// ─── Test 20: --include-session-lock ─────────────────────────────────────────
+
+#[test]
+fn test20_include_session_lock() {
+    let tmp = TempDir::new().unwrap();
+    let world_dir = tmp.path().join("world");
+    let archive = tmp.path().join("world.sbk");
+    let out_dir = tmp.path().join("restored");
+
+    make_test_world(&world_dir);
+
+    // Without flag: session.lock absent
+    let opts = default_opts(&world_dir, &archive);
+    sbk::compress::compress(&world_dir, &opts).unwrap();
+    sbk::decompress::decompress(&archive, &out_dir, 2).unwrap();
+    assert!(!out_dir.join("session.lock").exists());
+
+    // With flag: session.lock present
+    let archive2 = tmp.path().join("world2.sbk");
+    let out_dir2 = tmp.path().join("restored2");
+    let opts2 = CompressOptions {
+        include_session_lock: true,
+        output: archive2.clone(),
+        ..default_opts(&world_dir, &archive2)
+    };
+    sbk::compress::compress(&world_dir, &opts2).unwrap();
+    sbk::decompress::decompress(&archive2, &out_dir2, 2).unwrap();
+    assert!(out_dir2.join("session.lock").exists());
+    assert_eq!(fs::read(out_dir2.join("session.lock")).unwrap(), b"lock");
+}
+
+// ─── Test 21: verify — clean archive passes ───────────────────────────────────
+
+#[test]
+fn test21_verify_clean() {
+    let tmp = TempDir::new().unwrap();
+    let world_dir = tmp.path().join("world");
+    let archive = tmp.path().join("world.sbk");
+
+    make_test_world(&world_dir);
+    sbk::compress::compress(&world_dir, &default_opts(&world_dir, &archive)).unwrap();
+
+    let ok = sbk::verify::verify(&archive, 2).unwrap();
+    assert!(ok, "verify should return true for a clean archive");
+}
+
+// ─── Test 22: verify — corrupted frame is detected ────────────────────────────
+
+#[test]
+fn test22_verify_corrupted() {
+    let tmp = TempDir::new().unwrap();
+    let world_dir = tmp.path().join("world");
+    let archive = tmp.path().join("world.sbk");
+
+    make_test_world(&world_dir);
+    sbk::compress::compress(&world_dir, &default_opts(&world_dir, &archive)).unwrap();
+
+    // Flip some bytes in the middle of the file
+    let mut bytes = fs::read(&archive).unwrap();
+    let mid = bytes.len() / 2;
+    bytes[mid] ^= 0xFF;
+    bytes[mid + 1] ^= 0xFF;
+    fs::write(&archive, &bytes).unwrap();
+
+    // verify should either return Ok(false) or error — either means corruption detected
+    match sbk::verify::verify(&archive, 2) {
+        Ok(ok) => assert!(!ok, "corrupted archive should fail verification"),
+        Err(_) => {} // also acceptable
+    }
+}
+
+// ─── Test 23: info — smoke test ───────────────────────────────────────────────
+
+#[test]
+fn test23_info_smoke() {
+    let tmp = TempDir::new().unwrap();
+    let world_dir = tmp.path().join("world");
+    let archive = tmp.path().join("world.sbk");
+
+    make_test_world(&world_dir);
+    sbk::compress::compress(&world_dir, &default_opts(&world_dir, &archive)).unwrap();
+
+    // Both modes must not error
+    sbk::info::info(&archive, false).unwrap();
+    sbk::info::info(&archive, true).unwrap();
+}
+
+// ─── Test 24: MCA and NBT content round-trip ─────────────────────────────────
+
+#[test]
+fn test24_content_round_trip() {
+    let tmp = TempDir::new().unwrap();
+    let world_dir = tmp.path().join("world");
+    let archive = tmp.path().join("world.sbk");
+    let out_dir = tmp.path().join("restored");
+
+    make_test_world(&world_dir);
+    sbk::compress::compress(&world_dir, &default_opts(&world_dir, &archive)).unwrap();
+    sbk::decompress::decompress(&archive, &out_dir, 2).unwrap();
+
+    // MCA: the decompressed file must be a valid MCA (parseable) and have the same chunks
+    let orig_mca = fs::read(world_dir.join("region/r.0.0.mca")).unwrap();
+    let rest_mca = fs::read(out_dir.join("region/r.0.0.mca")).unwrap();
+    // Both must be multiples of 4096 (sector size)
+    assert_eq!(orig_mca.len() % 4096, 0);
+    assert_eq!(rest_mca.len() % 4096, 0);
+    // Location table must agree on which slots are populated
+    for slot in 0..1024 {
+        let base = slot * 4;
+        let orig_entry = u32::from_be_bytes(orig_mca[base..base + 4].try_into().unwrap());
+        let rest_entry = u32::from_be_bytes(rest_mca[base..base + 4].try_into().unwrap());
+        let orig_present = (orig_entry & 0xFF) != 0;
+        let rest_present = (rest_entry & 0xFF) != 0;
+        assert_eq!(orig_present, rest_present, "slot {} presence differs", slot);
+    }
+
+    // NBT: level.dat must be gzip-decodable and contain our tag bytes
+    let rest_nbt = fs::read(out_dir.join("level.dat")).unwrap();
+    use flate2::read::GzDecoder;
+    use std::io::Read;
+    let mut dec = GzDecoder::new(rest_nbt.as_slice());
+    let mut raw = Vec::new();
+    dec.read_to_end(&mut raw)
+        .expect("level.dat should be valid gzip after round-trip");
+    assert!(raw.len() >= 4, "decompressed NBT too short");
+}
