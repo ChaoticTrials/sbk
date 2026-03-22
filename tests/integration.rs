@@ -1,11 +1,12 @@
 use std::fs;
-use std::io::Write;
+use std::io::{Seek, SeekFrom, Write};
 use std::path::Path;
 
 use filetime::FileTime;
 use flate2::write::{GzEncoder, ZlibEncoder};
 use flate2::Compression;
 use tempfile::TempDir;
+use xz2::write::XzEncoder;
 
 use sbk::error::SbkError;
 use sbk::filter::{capture_now_ms, CompressOptions, FilterMode};
@@ -771,4 +772,210 @@ fn test24_content_round_trip() {
     dec.read_to_end(&mut raw)
         .expect("level.dat should be valid gzip after round-trip");
     assert!(raw.len() >= 4, "decompressed NBT too short");
+}
+
+// ─── Helper: build a minimal valid archive from scratch ──────────────────────
+
+fn make_crafted_archive(archive_path: &Path, entry_path: &str) {
+    use sbk::format::frame_dir::{write_frame_dir, FrameDir};
+    use sbk::format::header::{write_header, write_placeholder, Header, HEADER_DISK_SIZE};
+    use sbk::format::index::{write_index, IndexEntry};
+    use sbk::solid::compressor::FRAME_SIZE;
+
+    let mut f = fs::File::create(archive_path).unwrap();
+    write_placeholder(&mut f).unwrap();
+
+    let frame_dir_offset = HEADER_DISK_SIZE as u64;
+    let fd = FrameDir::new();
+    write_frame_dir(&mut f, &fd).unwrap();
+    let frame_dir_size = fd.disk_size();
+    let index_offset = frame_dir_offset + frame_dir_size;
+
+    let entries = vec![IndexEntry {
+        path: entry_path.to_string(),
+        mtime_ms: 0,
+        group_id: 3,
+        stream_offset: 0,
+        stream_raw_size: 0,
+        original_size: 0,
+        file_checksum: 0,
+    }];
+    let (index_compressed_size, index_raw_size, index_checksum) =
+        write_index(&entries, 1, &mut f).unwrap();
+
+    f.seek(SeekFrom::Start(0)).unwrap();
+    write_header(
+        &mut f,
+        &Header {
+            format_version: 1,
+            flags: 0,
+            reserved: 0,
+            file_count: 1,
+            frame_size_bytes: FRAME_SIZE,
+            frame_dir_offset,
+            frame_dir_size,
+            index_offset,
+            index_compressed_size,
+            index_raw_size,
+            index_checksum,
+        },
+    )
+    .unwrap();
+}
+
+// ─── Test 25: path traversal with `..` is rejected ───────────────────────────
+
+#[test]
+fn test25_path_traversal_dotdot_rejected() {
+    let tmp = TempDir::new().unwrap();
+    let archive = tmp.path().join("crafted.sbk");
+    let out_dir = tmp.path().join("out");
+
+    make_crafted_archive(&archive, "../escape.txt");
+
+    let result = sbk::extract::extract(&archive, &["**".to_string()], &out_dir, 1);
+    assert!(result.is_err(), "path traversal should be rejected");
+    let msg = result.unwrap_err().to_string();
+    assert!(
+        msg.contains("..") || msg.contains("traversal") || msg.contains("path"),
+        "unexpected error: {}",
+        msg
+    );
+}
+
+// ─── Test 26: absolute path in archive is rejected ───────────────────────────
+
+#[test]
+fn test26_absolute_path_in_archive_rejected() {
+    let tmp = TempDir::new().unwrap();
+    let archive = tmp.path().join("crafted.sbk");
+    let out_dir = tmp.path().join("out");
+
+    make_crafted_archive(&archive, "/etc/passwd");
+
+    let result = sbk::extract::extract(&archive, &["**".to_string()], &out_dir, 1);
+    assert!(result.is_err(), "absolute path should be rejected");
+    let msg = result.unwrap_err().to_string();
+    assert!(
+        msg.contains("absolute") || msg.contains("path"),
+        "unexpected error: {}",
+        msg
+    );
+}
+
+// ─── Test 27: malicious frame count is rejected ───────────────────────────────
+
+#[test]
+fn test27_malicious_frame_count_rejected() {
+    use std::io::Cursor;
+
+    // Frame count > MAX_FRAMES_PER_GROUP (1_000_000) for group 0
+    let mut data = Vec::new();
+    data.extend_from_slice(&1_000_001u32.to_le_bytes());
+
+    let result = sbk::format::frame_dir::read_frame_dir(&mut Cursor::new(data));
+    assert!(result.is_err());
+    let msg = result.unwrap_err().to_string();
+    assert!(
+        msg.contains("sanity limit") || msg.contains("frame count"),
+        "unexpected error: {}",
+        msg
+    );
+}
+
+// ─── Test 28: malicious index entry count is rejected ────────────────────────
+
+#[test]
+fn test28_malicious_index_entry_count_rejected() {
+    use std::io::Cursor;
+
+    // Craft a raw index claiming 20_000_000 entries (> MAX_INDEX_ENTRIES = 10_000_000)
+    let mut raw = Vec::new();
+    raw.extend_from_slice(&20_000_000u64.to_le_bytes());
+
+    let mut enc = XzEncoder::new(Vec::new(), 1);
+    enc.write_all(&raw).unwrap();
+    let compressed = enc.finish().unwrap();
+    let compressed_size = compressed.len() as u64;
+    let checksum = sbk::checksum::hash(&compressed);
+
+    let result =
+        sbk::format::index::read_index(&mut Cursor::new(compressed), compressed_size, checksum);
+    assert!(result.is_err());
+    let msg = result.unwrap_err().to_string();
+    assert!(
+        msg.contains("sanity limit") || msg.contains("entry count"),
+        "unexpected error: {}",
+        msg
+    );
+}
+
+// ─── Test 29: malicious index compressed size is rejected ────────────────────
+
+#[test]
+fn test29_malicious_index_compressed_size_rejected() {
+    use std::io::Cursor;
+
+    // 300 MiB > MAX_INDEX_COMPRESSED_SIZE (256 MiB)
+    let huge: u64 = 300 * 1024 * 1024;
+    let result = sbk::format::index::read_index(&mut Cursor::new(Vec::<u8>::new()), huge, 0);
+    assert!(result.is_err());
+    let msg = result.unwrap_err().to_string();
+    assert!(
+        msg.contains("sanity limit") || msg.contains("index compressed"),
+        "unexpected error: {}",
+        msg
+    );
+}
+
+// ─── Test 30: empty world compresses and decompresses without error ───────────
+
+#[test]
+fn test30_empty_world_round_trip() {
+    let tmp = TempDir::new().unwrap();
+    let world_dir = tmp.path().join("empty_world");
+    let archive = tmp.path().join("empty.sbk");
+    let out_dir = tmp.path().join("restored");
+
+    fs::create_dir_all(&world_dir).unwrap();
+
+    let opts = default_opts(&world_dir, &archive);
+    sbk::compress::compress(&world_dir, &opts).unwrap();
+    assert!(archive.exists());
+
+    sbk::decompress::decompress(&archive, &out_dir, 2).unwrap();
+
+    // extract with ** on an empty archive returns 0 files
+    let n = sbk::extract::extract(&archive, &["**".to_string()], &out_dir, 2).unwrap();
+    assert_eq!(n, 0);
+}
+
+// ─── Test 31: two actual exclude patterns ────────────────────────────────────
+// (test09 uses only one pattern despite its name; this test exercises two)
+
+#[test]
+fn test31_exclude_two_actual_patterns() {
+    let tmp = TempDir::new().unwrap();
+    let world_dir = tmp.path().join("world");
+    let archive = tmp.path().join("world.sbk");
+    let out_dir = tmp.path().join("restored");
+
+    make_test_world(&world_dir);
+
+    let p1 = glob::Pattern::new("region/*.mca").unwrap();
+    let p2 = glob::Pattern::new("DIM-1/**").unwrap();
+    let opts = CompressOptions {
+        patterns: FilterMode::Exclude(vec![p1, p2]),
+        ..default_opts(&world_dir, &archive)
+    };
+    sbk::compress::compress(&world_dir, &opts).unwrap();
+    sbk::decompress::decompress(&archive, &out_dir, 2).unwrap();
+
+    // Both MCA files excluded by their respective patterns
+    assert!(!out_dir.join("region/r.0.0.mca").exists());
+    assert!(!out_dir.join("DIM-1/region/r.0.0.mca").exists());
+    // Non-excluded files still present
+    assert!(out_dir.join("level.dat").exists());
+    assert!(out_dir.join("icon.png").exists());
+    assert!(out_dir.join("advancements/player.json").exists());
 }
