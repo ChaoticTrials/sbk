@@ -66,7 +66,7 @@ Every file that passes the compression filters is assigned to exactly one of fou
 | 2        | `JSON` | `**/*.json`                       | Minify (remove all insignificant whitespace)        |
 | 3        | `RAW`  | everything else                   | No preprocessing, store verbatim                    |
 
-Classification is based purely on file extension. `session.lock` falls into `RAW` but is always excluded regardless of filters.
+Classification is based purely on file extension. `session.lock` falls into `RAW` and is excluded by default; pass `--include-session-lock` to override.
 
 ---
 
@@ -76,7 +76,7 @@ Compression filters are evaluated during file enumeration, before classification
 
 Filters are applied in this order:
 
-1. **Hardcoded skip**: `session.lock` is always excluded regardless of any user flags.
+1. **Hardcoded skip**: `session.lock` is excluded by default. Pass `--include-session-lock` to override.
 2. **Relative age filter** (optional, `--max-age <ms>`): skip files whose mtime is more than N milliseconds before now.
 3. **Absolute timestamp filter** (optional, `--since <timestamp>`): skip files whose mtime is below the given millisecond Unix timestamp.
 4. **Pattern filter** (optional, `--exclude` or `--include`, mutually exclusive): skip files that do not match the user's pattern rules.
@@ -165,12 +165,14 @@ error: --exclude and --include are mutually exclusive; use one or the other
 
 ```rust
 pub struct CompressOptions {
-    pub output:   PathBuf,
-    pub threads:  usize,
-    pub level:    u32,           // LZMA preset 1–9
-    pub max_age:  Option<u64>,   // milliseconds; None = no relative age filter
-    pub since:    Option<i64>,   // millisecond Unix timestamp; None = no absolute filter
-    pub patterns: FilterMode,
+    pub output:               PathBuf,
+    pub threads:              usize,
+    pub level:                u32,           // LZMA preset 1–9
+    pub max_age:              Option<u64>,   // milliseconds; None = no relative age filter
+    pub since:                Option<i64>,   // millisecond Unix timestamp; None = no absolute filter
+    pub patterns:             FilterMode,
+    pub include_session_lock: bool,          // if true, session.lock is not excluded
+    pub quiet:                bool,          // suppress all output (progress bars + summary)
 }
 
 pub enum FilterMode {
@@ -184,15 +186,16 @@ pub enum FilterMode {
 
 ```rust
 pub fn accept(
-    rel_path:   &str,
-    mtime_ms:   i64,
-    now_ms:     i64,
-    max_age_ms: Option<u64>,
-    since_ms:   Option<i64>,
-    filter:     &FilterMode,
+    rel_path:             &str,
+    mtime_ms:             i64,
+    now_ms:               i64,
+    max_age_ms:           Option<u64>,
+    since_ms:             Option<i64>,
+    filter:               &FilterMode,
+    include_session_lock: bool,
 ) -> bool {
-    // 1. Hardcoded skip
-    if rel_path == "session.lock" { return false; }
+    // 1. Hardcoded skip (overridable)
+    if !include_session_lock && rel_path == "session.lock" { return false; }
 
     // 2. Relative age filter
     if let Some(age) = max_age_ms {
@@ -369,12 +372,12 @@ offset
 44        8     u64     index_compressed_size   compressed byte size of Index Block
 52        8     u64     index_raw_size          uncompressed byte size of Index Block
 60        4     u32     index_checksum          xxHash32 of the compressed index bytes
-64        4     u32     header_checksum         xxHash32 of bytes 0–67 (this field = 0 during compute)
+64        4     u32     header_checksum         xxHash32 of bytes 0–71 (this field = 0 during compute)
 ```
 
 Total on disk: 8 bytes magic + 68 bytes header = **76 bytes** before the Frame Directory.
 
-**Computing `header_checksum`:** zero the 4 bytes at relative offset 64, compute xxHash32 over bytes 0–67 (68 bytes), write the result back at offset 64.
+**Computing `header_checksum`:** zero the 4 bytes at relative offset 64 (absolute bytes 72–75), compute xxHash32 over bytes 0–71 (72 bytes — covering all fields including `index_checksum`), write the result back at offset 64.
 
 ### 6.4 Frame Directory (at `frame_dir_offset`)
 
@@ -555,15 +558,19 @@ COMPRESS OPTIONS:
       --exclude  <pattern>...        Skip files matching any of these glob patterns
       --include  <pattern>...        Include ONLY files matching any of these glob patterns
                                      (--exclude and --include are mutually exclusive)
+      --include-session-lock         Include session.lock (excluded by default)
+  -q, --quiet                        Suppress progress bars and summary output
 
 DECOMPRESS OPTIONS:
   -o, --output  <dir>                Default: <world_name>/ in current dir
   -t, --threads <n>                  Default: logical CPU count
+  -q, --quiet                        Suppress output
 
 EXTRACT OPTIONS:
   <pattern>...                       One or more exact paths or glob patterns (required)
   -o, --output  <dir>                Default: current dir; preserves subdirectory structure
   -t, --threads <n>                  Default: logical CPU count
+  -q, --quiet                        Suppress output
 
 INFO OPTIONS:
   --list                             Print full file manifest table
@@ -572,7 +579,7 @@ NOTES:
   sbk decompress is equivalent to: sbk extract <file.sbk> "**"
   sbk verify exits with code 0 on success, 1 on any checksum failure.
   Files excluded during compression are absent from the archive and cannot be extracted.
-  session.lock is always excluded from compression regardless of any filter flags.
+  session.lock is excluded by default; use --include-session-lock to override.
 ```
 
 ### 9.1 Startup Validation (compress)
