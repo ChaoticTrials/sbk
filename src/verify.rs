@@ -51,12 +51,12 @@ pub fn verify(archive: &Path, threads: usize) -> anyhow::Result<bool> {
     }
 
     // Verify checksums in parallel
-    let failures: Vec<u32> = frame_buffers
+    let failures: Vec<(u8, u32)> = frame_buffers
         .par_iter()
-        .filter_map(|(_, fi, data, expected)| {
+        .filter_map(|(group, fi, data, expected)| {
             let computed = hash(data);
             if computed != *expected {
-                Some(*fi)
+                Some((*group, *fi))
             } else {
                 None
             }
@@ -67,8 +67,8 @@ pub fn verify(archive: &Path, threads: usize) -> anyhow::Result<bool> {
         println!("All {} frame(s) OK.", frames_to_check.len());
         Ok(true)
     } else {
-        for fi in &failures {
-            eprintln!("FAIL: frame {} checksum mismatch", fi);
+        for (group, fi) in &failures {
+            eprintln!("FAIL: frame {} in group {} checksum mismatch", fi, group);
         }
         println!(
             "{} frame(s) failed verification out of {}.",

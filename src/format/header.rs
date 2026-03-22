@@ -21,7 +21,7 @@ pub const MAGIC: [u8; 8] = [0x53, 0x42, 0x4B, 0x21, 0x56, 0x31, 0x0D, 0x0A];
 ///   52    44    8     index_compressed_size (u64)
 ///   60    52    8     index_raw_size (u64)
 ///   68    60    4     index_checksum (u32)
-///   72    64    4     header_checksum (u32) = xxHash32(bytes 0..68 with this field = 0)
+///   72    64    4     header_checksum (u32) = xxHash32(bytes 0..72 with this field = 0)
 ///
 /// Total on disk = 76 bytes (8 magic + 68 header section).
 /// The spec table says "relative offset 64" for header_checksum within the 60-byte section,
@@ -91,8 +91,9 @@ fn serialize(h: &Header) -> [u8; HEADER_DISK_SIZE] {
 /// Write header to `w`. Computes and writes header_checksum.
 pub fn write_header(w: &mut impl Write, h: &Header) -> anyhow::Result<()> {
     let mut buf = serialize(h);
-    // header_checksum = xxHash32 of bytes 0..68 (68 bytes), with header_checksum field zeroed
-    let checksum = hash(&buf[0..68]);
+    // header_checksum = xxHash32 of bytes 0..72, with the header_checksum field (bytes 72..76)
+    // zeroed during computation. This covers all header fields including index_checksum.
+    let checksum = hash(&buf[0..72]);
     buf[72..76].copy_from_slice(&checksum.to_le_bytes());
     w.write_all(&buf)?;
     Ok(())
@@ -119,11 +120,11 @@ pub fn read_header(r: &mut (impl Read + Seek)) -> anyhow::Result<Header> {
         return Err(SbkError::UnsupportedVersion(format_version).into());
     }
 
-    // Verify header_checksum
+    // Verify header_checksum: covers bytes 0..72 with bytes 72..76 zeroed.
     let stored = u32::from_le_bytes(buf[72..76].try_into().unwrap());
     let mut tmp = buf;
     tmp[72..76].fill(0);
-    let computed = hash(&tmp[0..68]);
+    let computed = hash(&tmp[0..72]);
     if computed != stored {
         return Err(SbkError::HeaderChecksumMismatch.into());
     }

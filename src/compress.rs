@@ -256,11 +256,16 @@ pub fn compress(world_dir: &Path, opts: &CompressOptions) -> anyhow::Result<()> 
 
     // === Seek back and write the final header ===
     out.seek(SeekFrom::Start(0))?;
+    // Use the actual number of index entries written, not the pre-filter count.
+    // Files that fail to read or preprocess are silently skipped and not added
+    // to all_index_entries, so total_included may be higher than the truth.
+    let actual_file_count = all_index_entries.len() as u64;
+
     let header = Header {
         format_version: 1,
         flags: 0,
         reserved: 0,
-        file_count: total_included,
+        file_count: actual_file_count,
         frame_size_bytes: FRAME_SIZE,
         frame_dir_offset,
         frame_dir_size,
@@ -275,7 +280,7 @@ pub fn compress(world_dir: &Path, opts: &CompressOptions) -> anyhow::Result<()> 
     if !opts.quiet {
         println!(
             "Scanned {} files → included {}  ({} skipped by filters)",
-            total_scanned, total_included, skipped
+            total_scanned, actual_file_count, skipped
         );
         if let Some(age) = opts.max_age {
             let cutoff = now_ms - age as i64;
