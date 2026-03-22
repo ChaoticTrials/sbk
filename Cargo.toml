@@ -15,16 +15,16 @@ path = "src/main.rs"
 clap = { version = "4", features = ["derive"] }
 xz2 = "0.1"
 flate2 = "1"
-ruzstd = "0.7"
+ruzstd = "0.8"
 xxhash-rust = { version = "0.8", features = ["xxh32"] }
 rayon = "1"
 walkdir = "2"
 filetime = "0.2"
 glob = "0.3"
 serde_json = "1"
-indicatif = "0.17"
+indicatif = "0.18"
 anyhow = "1"
-thiserror = "1"
+thiserror = "2"
 
 [dev-dependencies]
 tempfile = "3"

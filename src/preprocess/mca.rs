@@ -28,7 +28,7 @@ fn decompress_chunk(data: &[u8], ctype: u8) -> anyhow::Result<Vec<u8>> {
         3 => Ok(data.to_vec()),
         4 => {
             let mut out = Vec::new();
-            let mut decoder = ruzstd::StreamingDecoder::new(data)
+            let mut decoder = ruzstd::decoding::StreamingDecoder::new(data)
                 .map_err(|e| anyhow::anyhow!("zstd decode error: {}", e))?;
             decoder.read_to_end(&mut out)?;
             Ok(out)
