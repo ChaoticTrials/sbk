@@ -17,6 +17,13 @@ pub fn preprocess_nbt_from_bytes(bytes: &[u8]) -> anyhow::Result<Vec<u8>> {
     Ok(buf)
 }
 
+/// Reconstruct an NBT file from raw (decompressed) bytes, returning gzip-wrapped bytes.
+pub fn reconstruct_nbt_bytes(raw: &[u8]) -> anyhow::Result<Vec<u8>> {
+    let mut enc = GzEncoder::new(Vec::new(), Compression::new(6));
+    enc.write_all(raw)?;
+    Ok(enc.finish()?)
+}
+
 pub fn reconstruct_nbt(raw: &[u8], out_path: &Path) -> anyhow::Result<()> {
     if let Some(parent) = out_path.parent() {
         std::fs::create_dir_all(parent)?;

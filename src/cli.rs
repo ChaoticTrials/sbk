@@ -101,4 +101,22 @@ pub enum Commands {
         #[arg(short, long, default_value_t = default_threads())]
         threads: usize,
     },
+    /// Convert an SBK archive to a standard archive format (zip, tar.gz, tar.xz)
+    Convert {
+        /// Path to the SBK archive
+        archive: PathBuf,
+        /// Target format: zip, tar.gz, tar.xz
+        #[arg(long, value_name = "FORMAT")]
+        to: String,
+        /// Output file path (default: <archive_stem>.<ext> in current dir)
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+        /// Number of threads for SBK decompression (default: logical CPU count)
+        #[arg(short, long, default_value_t = default_threads())]
+        threads: usize,
+        /// Compression level 1–9 for the target format (default: 6)
+        #[arg(short, long, default_value_t = 6,
+              value_parser = clap::value_parser!(u32).range(1..=9))]
+        level: u32,
+    },
 }

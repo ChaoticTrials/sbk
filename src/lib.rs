@@ -3,6 +3,7 @@ pub mod classify;
 pub mod cli;
 pub mod codec;
 pub mod compress;
+pub mod convert;
 pub mod decompress;
 pub mod error;
 pub mod extract;

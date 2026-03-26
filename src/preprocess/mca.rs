@@ -123,8 +123,8 @@ pub fn preprocess_mca_from_bytes(file_bytes: &[u8]) -> anyhow::Result<Vec<u8>> {
     Ok(out)
 }
 
-/// Reconstruct an MCA file from an MCAP byte stream.
-pub fn reconstruct_mca(mcap: &[u8], out_path: &Path) -> anyhow::Result<()> {
+/// Reconstruct an MCA file from an MCAP byte stream, returning the raw bytes.
+pub fn reconstruct_mca_bytes(mcap: &[u8]) -> anyhow::Result<Vec<u8>> {
     if mcap.len() < 6 {
         return Err(SbkError::InvalidMcap("too short").into());
     }
@@ -134,7 +134,6 @@ pub fn reconstruct_mca(mcap: &[u8], out_path: &Path) -> anyhow::Result<()> {
 
     let chunk_count = u16::from_le_bytes([mcap[4], mcap[5]]) as usize;
 
-    // Parse all (local_x, local_z, nbt_data) entries
     let mut raw_chunks: Vec<(u8, u8, Vec<u8>)> = Vec::with_capacity(chunk_count);
     let mut pos = 6;
     for _ in 0..chunk_count {
@@ -155,7 +154,6 @@ pub fn reconstruct_mca(mcap: &[u8], out_path: &Path) -> anyhow::Result<()> {
         raw_chunks.push((local_x, local_z, nbt));
     }
 
-    // Parallel zlib re-compression
     let compressed: Vec<(u8, u8, Vec<u8>)> = raw_chunks
         .par_iter()
         .map(|(x, z, nbt)| {
@@ -165,54 +163,45 @@ pub fn reconstruct_mca(mcap: &[u8], out_path: &Path) -> anyhow::Result<()> {
         })
         .collect::<anyhow::Result<_>>()?;
 
-    // Lay out sectors, build location and timestamp tables, write the file
-    if let Some(parent) = out_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-
-    // Compute sector layout
-    // Sectors 0 and 1 are the header (location + timestamp tables, 8192 bytes total)
     let mut sector_assignments: Vec<(u8, u8, u32, usize, Vec<u8>)> = Vec::new();
-    // (local_x, local_z, sector_offset, sector_count, compressed_data)
     let mut current_sector: u32 = 2;
 
     for (x, z, cdata) in &compressed {
-        // chunk header: 4 bytes length + 1 byte type
         let data_len = cdata.len();
-        let total_len = 5 + data_len; // length field (4) + type (1) + data
-                                      // length field value = compressed_len + 1 (includes the type byte)
-        let required_sectors = ((total_len + 4095) / 4096) as usize; // ceil division
+        let total_len = 5 + data_len;
+        let required_sectors = ((total_len + 4095) / 4096) as usize;
         sector_assignments.push((*x, *z, current_sector, required_sectors, cdata.clone()));
         current_sector += required_sectors as u32;
     }
 
-    // Total file size: round up to sector boundary
     let total_sectors = current_sector as usize;
     let mut file_data = vec![0u8; total_sectors * 4096];
 
-    // Fill location table
     for (x, z, sector_offset, sector_count, _) in &sector_assignments {
         let slot = (*z as usize) * 32 + (*x as usize);
         let base = slot * 4;
-        // [sector_offset: u24 BE | sector_count: u8]
         let entry = ((*sector_offset as u32) << 8) | (*sector_count as u32);
         let bytes = entry.to_be_bytes();
         file_data[base..base + 4].copy_from_slice(&bytes);
     }
 
-    // Timestamp table at bytes 4096–8191 (zeroed — already zero from vec init)
-
-    // Write chunk data
     for (_, _, sector_offset, _, cdata) in &sector_assignments {
         let pos = (*sector_offset as usize) * 4096;
-        // length = compressed_data_length + 1 (for the type byte)
         let length = (cdata.len() + 1) as u32;
         file_data[pos..pos + 4].copy_from_slice(&length.to_be_bytes());
-        file_data[pos + 4] = 2; // zlib compression type
+        file_data[pos + 4] = 2;
         file_data[pos + 5..pos + 5 + cdata.len()].copy_from_slice(cdata);
-        // remaining bytes in the last sector are zero (already)
     }
 
+    Ok(file_data)
+}
+
+/// Reconstruct an MCA file from an MCAP byte stream.
+pub fn reconstruct_mca(mcap: &[u8], out_path: &Path) -> anyhow::Result<()> {
+    let file_data = reconstruct_mca_bytes(mcap)?;
+    if let Some(parent) = out_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
     std::fs::write(out_path, &file_data)?;
     Ok(())
 }

@@ -1242,3 +1242,211 @@ fn frame_decompression_bomb_guard() {
         assert!(result.is_err(), "bomb guard must reject for {:?}", algo);
     }
 }
+
+// ─── Convert tests ────────────────────────────────────────────────────────────
+
+fn compress_test_world(tmp: &TempDir) -> (std::path::PathBuf, std::path::PathBuf) {
+    let world_dir = tmp.path().join("world");
+    let archive = tmp.path().join("world.sbk");
+    make_test_world(&world_dir);
+    let opts = default_opts(&world_dir, &archive);
+    sbk::compress::compress(&world_dir, &opts).unwrap();
+    (world_dir, archive)
+}
+
+#[test]
+fn test_convert_zip() {
+    use std::io::Read as _;
+
+    let tmp = TempDir::new().unwrap();
+    let (_world_dir, archive) = compress_test_world(&tmp);
+    let zip_path = tmp.path().join("world.zip");
+
+    let n =
+        sbk::convert::convert(&archive, &zip_path, sbk::convert::ConvertFormat::Zip, 2, 6).unwrap();
+    assert!(n > 0, "expected at least one file in converted ZIP");
+    assert!(zip_path.exists());
+
+    // Inspect ZIP contents
+    let zip_file = fs::File::open(&zip_path).unwrap();
+    let mut archive = zip::ZipArchive::new(zip_file).unwrap();
+    let names: Vec<String> = (0..archive.len())
+        .map(|i| archive.by_index(i).unwrap().name().to_string())
+        .collect();
+
+    assert!(
+        names.iter().any(|n| n.ends_with(".mca")),
+        "ZIP should contain an MCA file; got: {:?}",
+        names
+    );
+    assert!(
+        names.iter().any(|n| n == "level.dat"),
+        "ZIP should contain level.dat; got: {:?}",
+        names
+    );
+    assert!(
+        names.iter().any(|n| n.ends_with(".json")),
+        "ZIP should contain a JSON file; got: {:?}",
+        names
+    );
+    assert!(
+        names.iter().any(|n| n == "icon.png"),
+        "ZIP should contain icon.png; got: {:?}",
+        names
+    );
+
+    // Verify icon.png is byte-identical to original
+    let mut entry = archive
+        .by_name("icon.png")
+        .expect("icon.png must be in ZIP");
+    let mut data = Vec::new();
+    entry.read_to_end(&mut data).unwrap();
+    assert_eq!(data, b"\x89PNG\r\n\x1a\nfakeicon");
+
+    // session.lock must not be present
+    assert!(
+        !names.iter().any(|n| n == "session.lock"),
+        "session.lock must not appear in converted archive"
+    );
+}
+
+#[test]
+fn test_convert_tar_gz() {
+    let tmp = TempDir::new().unwrap();
+    let (_world_dir, archive) = compress_test_world(&tmp);
+    let tar_gz_path = tmp.path().join("world.tar.gz");
+
+    let n = sbk::convert::convert(
+        &archive,
+        &tar_gz_path,
+        sbk::convert::ConvertFormat::TarGz,
+        2,
+        6,
+    )
+    .unwrap();
+    assert!(n > 0);
+    assert!(tar_gz_path.exists());
+
+    // Inspect tar.gz contents
+    let file = fs::File::open(&tar_gz_path).unwrap();
+    let decoder = flate2::read::GzDecoder::new(file);
+    let mut tar = tar::Archive::new(decoder);
+    let names: Vec<String> = tar
+        .entries()
+        .unwrap()
+        .map(|e| e.unwrap().path().unwrap().to_string_lossy().to_string())
+        .collect();
+
+    assert!(
+        names.iter().any(|n| n.ends_with(".mca")),
+        "tar.gz should contain an MCA file; got: {:?}",
+        names
+    );
+    assert!(
+        names.iter().any(|n| n == "level.dat"),
+        "tar.gz should contain level.dat; got: {:?}",
+        names
+    );
+    assert!(
+        !names.iter().any(|n| n == "session.lock"),
+        "session.lock must not appear in converted archive"
+    );
+}
+
+#[test]
+fn test_convert_tar_xz() {
+    let tmp = TempDir::new().unwrap();
+    let (_world_dir, archive) = compress_test_world(&tmp);
+    let tar_xz_path = tmp.path().join("world.tar.xz");
+
+    let n = sbk::convert::convert(
+        &archive,
+        &tar_xz_path,
+        sbk::convert::ConvertFormat::TarXz,
+        2,
+        1, // fast for test
+    )
+    .unwrap();
+    assert!(n > 0);
+    assert!(tar_xz_path.exists());
+
+    // Inspect tar.xz contents
+    let file = fs::File::open(&tar_xz_path).unwrap();
+    let decoder = xz2::read::XzDecoder::new(file);
+    let mut tar = tar::Archive::new(decoder);
+    let names: Vec<String> = tar
+        .entries()
+        .unwrap()
+        .map(|e| e.unwrap().path().unwrap().to_string_lossy().to_string())
+        .collect();
+
+    assert!(
+        names.iter().any(|n| n.ends_with(".mca")),
+        "tar.xz should contain an MCA file; got: {:?}",
+        names
+    );
+    assert!(
+        names.iter().any(|n| n == "level.dat"),
+        "tar.xz should contain level.dat; got: {:?}",
+        names
+    );
+    assert!(
+        !names.iter().any(|n| n == "session.lock"),
+        "session.lock must not appear in converted archive"
+    );
+}
+
+#[test]
+fn test_convert_invalid_format() {
+    let tmp = TempDir::new().unwrap();
+    let (_world_dir, _archive) = compress_test_world(&tmp);
+
+    // ConvertFormat::from_str should return None for unknown format
+    let fmt = sbk::convert::ConvertFormat::from_str("rar");
+    assert!(fmt.is_none(), "unknown format must return None");
+}
+
+#[test]
+fn test_convert_default_output_path() {
+    // The default output path logic is in main.rs; test it by verifying the
+    // extension() method returns the right string for each format.
+    use sbk::convert::ConvertFormat;
+
+    let stem = "myworld";
+    let zip_path = format!("{}{}", stem, ConvertFormat::Zip.extension());
+    let tar_gz_path = format!("{}{}", stem, ConvertFormat::TarGz.extension());
+    let tar_xz_path = format!("{}{}", stem, ConvertFormat::TarXz.extension());
+
+    assert_eq!(zip_path, "myworld.zip");
+    assert_eq!(tar_gz_path, "myworld.tar.gz");
+    assert_eq!(tar_xz_path, "myworld.tar.xz");
+}
+
+#[test]
+fn test_convert_zip_round_trip_mca() {
+    // Compress a world with an MCA file, convert to ZIP, and verify the MCA
+    // can be re-preprocessed to yield the same chunk data.
+    use std::io::Read as _;
+
+    let tmp = TempDir::new().unwrap();
+    let (_world_dir, archive) = compress_test_world(&tmp);
+    let zip_path = tmp.path().join("world_rt.zip");
+
+    sbk::convert::convert(&archive, &zip_path, sbk::convert::ConvertFormat::Zip, 2, 1).unwrap();
+
+    let zip_file = fs::File::open(&zip_path).unwrap();
+    let mut za = zip::ZipArchive::new(zip_file).unwrap();
+
+    // Read back region/r.0.0.mca from ZIP and verify it parses as valid MCA
+    let mca_data = {
+        let mut entry = za.by_name("region/r.0.0.mca").expect("MCA must be in ZIP");
+        let mut buf = Vec::new();
+        entry.read_to_end(&mut buf).unwrap();
+        buf
+    };
+
+    // Re-preprocess it — should succeed and yield 5 chunks
+    let mcap = sbk::preprocess::mca::preprocess_mca_from_bytes(&mca_data).unwrap();
+    let chunk_count = u16::from_le_bytes([mcap[4], mcap[5]]);
+    assert_eq!(chunk_count, 5, "reconstructed MCA must have 5 chunks");
+}

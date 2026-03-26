@@ -5,6 +5,7 @@ use std::time::Instant;
 use clap::Parser;
 
 use sbk::cli::{Cli, Commands};
+use sbk::convert::ConvertFormat;
 use sbk::error::SbkError;
 use sbk::filter::{CompressOptions, FilterMode};
 use sbk::format::header::Algorithm;
@@ -172,6 +173,36 @@ fn run() -> anyhow::Result<()> {
             if !ok {
                 process::exit(1);
             }
+        }
+
+        Commands::Convert {
+            archive,
+            to,
+            output,
+            threads,
+            level,
+        } => {
+            let format = ConvertFormat::from_str(&to).ok_or_else(|| {
+                anyhow::anyhow!("unknown format '{}': expected zip, tar.gz, or tar.xz", to)
+            })?;
+
+            let output = output.unwrap_or_else(|| {
+                let stem = archive
+                    .file_stem()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string();
+                PathBuf::from(format!("{}{}", stem, format.extension()))
+            });
+
+            let t = Instant::now();
+            let n = sbk::convert::convert(&archive, &output, format, threads, level)?;
+            println!(
+                "Converted {} file(s) → {} in {:.2}s.",
+                n,
+                output.display(),
+                t.elapsed().as_secs_f64()
+            );
         }
     }
 
