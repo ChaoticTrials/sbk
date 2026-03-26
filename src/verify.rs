@@ -5,6 +5,7 @@ use std::path::Path;
 use rayon::prelude::*;
 
 use crate::checksum::hash;
+use crate::codec;
 use crate::format::frame_dir::read_frame_dir;
 use crate::format::header::read_header;
 use crate::format::index::read_index;
@@ -19,13 +20,19 @@ pub fn verify(archive: &Path, threads: usize) -> anyhow::Result<bool> {
 
     let mut f = File::open(archive)?;
     let header = read_header(&mut f)?;
+    let codec = codec::from_algorithm(header.algorithm);
 
     f.seek(SeekFrom::Start(header.frame_dir_offset))?;
     let frame_dir = read_frame_dir(&mut f)?;
 
     // Also verify the index checksum
     f.seek(SeekFrom::Start(header.index_offset))?;
-    let _entries = read_index(&mut f, header.index_compressed_size, header.index_checksum)?;
+    let _entries = read_index(
+        &mut f,
+        &*codec,
+        header.index_compressed_size,
+        header.index_checksum,
+    )?;
 
     // Collect all frames to verify
     let mut frames_to_check: Vec<(u8, u32, u64, u32, u32)> = Vec::new(); // (group, frame_idx, offset, compressed_sz, expected_checksum)

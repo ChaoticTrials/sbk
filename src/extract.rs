@@ -2,13 +2,15 @@ use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
-use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use rayon::prelude::*;
 
 use crate::checksum::hash;
 use crate::classify::Group;
+use crate::codec;
 use crate::error::SbkError;
 use crate::format::frame_dir::read_frame_dir;
 use crate::format::header::read_header;
@@ -22,6 +24,35 @@ pub fn extract(
     output_dir: &Path,
     threads: usize,
 ) -> anyhow::Result<u64> {
+    extract_impl(archive, patterns, output_dir, threads, |_, _, _| {}, true)
+}
+
+/// Extraction with a progress callback for GUI use.
+/// `on_progress(completed, total, current_path)` is called after each file is written.
+pub fn extract_with_progress<F>(
+    archive: &Path,
+    patterns: &[String],
+    output_dir: &Path,
+    threads: usize,
+    on_progress: F,
+) -> anyhow::Result<u64>
+where
+    F: Fn(usize, usize, &str) + Send + Sync,
+{
+    extract_impl(archive, patterns, output_dir, threads, on_progress, false)
+}
+
+fn extract_impl<F>(
+    archive: &Path,
+    patterns: &[String],
+    output_dir: &Path,
+    threads: usize,
+    on_file_written: F,
+    show_bars: bool,
+) -> anyhow::Result<u64>
+where
+    F: Fn(usize, usize, &str) + Send + Sync,
+{
     rayon::ThreadPoolBuilder::new()
         .num_threads(threads)
         .build_global()
@@ -30,12 +61,18 @@ pub fn extract(
     // Stage 1: read header, frame dir, index
     let mut f = File::open(archive)?;
     let header = read_header(&mut f)?;
+    let codec = codec::from_algorithm(header.algorithm);
 
     f.seek(SeekFrom::Start(header.frame_dir_offset))?;
     let frame_dir = read_frame_dir(&mut f)?;
 
     f.seek(SeekFrom::Start(header.index_offset))?;
-    let all_entries = read_index(&mut f, header.index_compressed_size, header.index_checksum)?;
+    let all_entries = read_index(
+        &mut f,
+        &*codec,
+        header.index_compressed_size,
+        header.index_checksum,
+    )?;
 
     // Match patterns
     let matched = find_patterns(&all_entries, patterns)?;
@@ -81,7 +118,11 @@ pub fn extract(
         }
     }
 
-    let mp = MultiProgress::new();
+    let mp = if show_bars {
+        MultiProgress::new()
+    } else {
+        MultiProgress::with_draw_target(ProgressDrawTarget::hidden())
+    };
     let bar_style = ProgressStyle::with_template("{prefix} [{bar:40}] {pos}/{len} {wide_msg}")
         .unwrap()
         .progress_chars("=> ");
@@ -149,21 +190,10 @@ pub fn extract(
     let decompressed_frames: HashMap<(u8, u32), Vec<u8>> = frame_data_map
         .par_iter()
         .map(|(&key, compressed)| {
-            use std::io::Read as IoRead;
-            let expected_raw_sz = frame_raw_sz_map[&key] as usize;
-            let mut dec = xz2::read::XzDecoder::new(&compressed[..]);
-            // Pre-allocate to expected size and read exactly that many bytes,
-            // preventing decompression bombs from expanding beyond the declared frame size.
-            let mut raw = Vec::with_capacity(expected_raw_sz);
-            dec.by_ref().take(expected_raw_sz as u64 + 1).read_to_end(&mut raw)?;
-            if raw.len() > expected_raw_sz {
-                return Err(anyhow::anyhow!(
-                    "frame ({},{}) decompressed to more than declared {} bytes",
-                    key.0,
-                    key.1,
-                    expected_raw_sz
-                ));
-            }
+            let expected_raw_sz = frame_raw_sz_map[&key];
+            let raw = codec.decompress(compressed, expected_raw_sz).map_err(|e| {
+                anyhow::anyhow!("frame ({},{}) decompression failed: {}", key.0, key.1, e)
+            })?;
             bar_decomp2.inc(1);
             Ok((key, raw))
         })
@@ -176,6 +206,8 @@ pub fn extract(
     bar_write.set_style(bar_style);
     bar_write.set_prefix("Writing      ");
 
+    let total = matched.len();
+    let completed = Arc::new(AtomicUsize::new(0));
     let created_dirs: Mutex<HashSet<PathBuf>> = Mutex::new(HashSet::new());
 
     let written: Vec<anyhow::Result<()>> = matched
@@ -231,6 +263,8 @@ pub fn extract(
             filetime::set_file_mtime(&out_path, ft)?;
 
             bar_write.inc(1);
+            let n = completed.fetch_add(1, Ordering::Relaxed) + 1;
+            on_file_written(n, total, &entry.path);
             Ok(())
         })
         .collect();

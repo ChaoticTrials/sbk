@@ -49,6 +49,10 @@ pub enum Commands {
         /// Suppress all output (progress bars and summary)
         #[arg(short, long)]
         quiet: bool,
+        /// Compression algorithm: lzma2 (default) or zstd.
+        /// For zstd, --level 1–9 maps to zstd levels 3–19 internally.
+        #[arg(long, default_value = "lzma2", value_name = "ALGO")]
+        algorithm: String,
     },
     /// Decompress an SBK archive into a directory
     Decompress {

@@ -1,6 +1,7 @@
 pub mod checksum;
 pub mod classify;
 pub mod cli;
+pub mod codec;
 pub mod compress;
 pub mod decompress;
 pub mod error;

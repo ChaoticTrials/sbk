@@ -105,10 +105,16 @@ unzip -q "$ZIP_FILE" -d "$WORK_DIR"
     echo "## Commands Used"
     echo ""
     echo '```bash'
-    echo "# SBK ($SBK_VER)"
+    echo "# SBK ($SBK_VER) — lzma2 (default)"
     echo "sbk compress <world> -o <world>.sbk -l 1 -t $THREADS"
     echo "sbk compress <world> -o <world>.sbk -l 5 -t $THREADS"
     echo "sbk compress <world> -o <world>.sbk -l 9 -t $THREADS"
+    echo "sbk decompress <world>.sbk -o <out_dir>/ -t $THREADS"
+    echo ""
+    echo "# SBK ($SBK_VER) — zstd"
+    echo "sbk compress <world> -o <world>.sbk --algorithm zstd -l 1 -t $THREADS"
+    echo "sbk compress <world> -o <world>.sbk --algorithm zstd -l 5 -t $THREADS"
+    echo "sbk compress <world> -o <world>.sbk --algorithm zstd -l 9 -t $THREADS"
     echo "sbk decompress <world>.sbk -o <out_dir>/ -t $THREADS"
     echo ""
     echo "# zip"
@@ -153,6 +159,9 @@ for version_dir in "$WORK_DIR"/*/; do
         echo "   Uncompressed: $(fmt_size $raw_bytes)"
 
         out="$OUT_DIR/out.sbk"
+        sbkz1_ok=false; sz_sbkz1=0; ms_sbkz1_c=0; ms_sbkz1_d=0
+        sbkz5_ok=false; sz_sbkz5=0; ms_sbkz5_c=0; ms_sbkz5_d=0
+        sbkz9_ok=false; sz_sbkz9=0; ms_sbkz9_c=0; ms_sbkz9_d=0
 
         # ── sbk -l 1 ──────────────────────────────────────────────────────────
         printf "   sbk -l 1  … "
@@ -185,6 +194,36 @@ for version_dir in "$WORK_DIR"/*/; do
             run_timed "$SBK" decompress "$out" -o "$DEC_DIR/sbk9/" -t "$THREADS" >/dev/null 2>&1 || true
             ms_sbk9_d=$_ms; rm -f "$out"; sbk9_ok=true
             echo "$(fmt_size $sz_sbk9)  $(fmt_ratio $raw_bytes $sz_sbk9)  c:$(fmt_time $ms_sbk9_c)  d:$(fmt_time $ms_sbk9_d)"
+        else echo "FAILED"; fi
+
+        # ── sbk zstd -l 1 ─────────────────────────────────────────────────────
+        printf "   sbk zstd -l 1 … "
+        if run_timed "$SBK" compress "$world_dir" -o "$out" --algorithm zstd -l 1 -t "$THREADS" >/dev/null 2>&1; then
+            ms_sbkz1_c=$_ms; sz_sbkz1=$(du -sb "$out" | awk '{print $1}')
+            rm -rf "$DEC_DIR/sbkz1"; mkdir -p "$DEC_DIR/sbkz1"
+            run_timed "$SBK" decompress "$out" -o "$DEC_DIR/sbkz1/" -t "$THREADS" >/dev/null 2>&1 || true
+            ms_sbkz1_d=$_ms; rm -f "$out"; sbkz1_ok=true
+            echo "$(fmt_size $sz_sbkz1)  $(fmt_ratio $raw_bytes $sz_sbkz1)  c:$(fmt_time $ms_sbkz1_c)  d:$(fmt_time $ms_sbkz1_d)"
+        else echo "FAILED"; fi
+
+        # ── sbk zstd -l 5 ─────────────────────────────────────────────────────
+        printf "   sbk zstd -l 5 … "
+        if run_timed "$SBK" compress "$world_dir" -o "$out" --algorithm zstd -l 5 -t "$THREADS" >/dev/null 2>&1; then
+            ms_sbkz5_c=$_ms; sz_sbkz5=$(du -sb "$out" | awk '{print $1}')
+            rm -rf "$DEC_DIR/sbkz5"; mkdir -p "$DEC_DIR/sbkz5"
+            run_timed "$SBK" decompress "$out" -o "$DEC_DIR/sbkz5/" -t "$THREADS" >/dev/null 2>&1 || true
+            ms_sbkz5_d=$_ms; rm -f "$out"; sbkz5_ok=true
+            echo "$(fmt_size $sz_sbkz5)  $(fmt_ratio $raw_bytes $sz_sbkz5)  c:$(fmt_time $ms_sbkz5_c)  d:$(fmt_time $ms_sbkz5_d)"
+        else echo "FAILED"; fi
+
+        # ── sbk zstd -l 9 ─────────────────────────────────────────────────────
+        printf "   sbk zstd -l 9 … "
+        if run_timed "$SBK" compress "$world_dir" -o "$out" --algorithm zstd -l 9 -t "$THREADS" >/dev/null 2>&1; then
+            ms_sbkz9_c=$_ms; sz_sbkz9=$(du -sb "$out" | awk '{print $1}')
+            rm -rf "$DEC_DIR/sbkz9"; mkdir -p "$DEC_DIR/sbkz9"
+            run_timed "$SBK" decompress "$out" -o "$DEC_DIR/sbkz9/" -t "$THREADS" >/dev/null 2>&1 || true
+            ms_sbkz9_d=$_ms; rm -f "$out"; sbkz9_ok=true
+            echo "$(fmt_size $sz_sbkz9)  $(fmt_ratio $raw_bytes $sz_sbkz9)  c:$(fmt_time $ms_sbkz9_c)  d:$(fmt_time $ms_sbkz9_d)"
         else echo "FAILED"; fi
 
         # ── zip ───────────────────────────────────────────────────────────────
@@ -276,9 +315,12 @@ for version_dir in "$WORK_DIR"/*/; do
             echo "| Method | Size | Ratio | Compress | Decompress |"
             echo "|--------|-----:|------:|---------:|-----------:|"
             echo "| Uncompressed | $(fmt_size $raw_bytes) | 100% | — | — |"
-            $sbk1_ok && echo "| **sbk -l 1** | $(fmt_size $sz_sbk1) | $(fmt_ratio $raw_bytes $sz_sbk1) | $(fmt_time $ms_sbk1_c) | $(fmt_time $ms_sbk1_d) |" || echo "| **sbk -l 1** | — | — | FAILED | — |"
-            $sbk5_ok && echo "| **sbk -l 5** | $(fmt_size $sz_sbk5) | $(fmt_ratio $raw_bytes $sz_sbk5) | $(fmt_time $ms_sbk5_c) | $(fmt_time $ms_sbk5_d) |" || echo "| **sbk -l 5** | — | — | FAILED | — |"
-            $sbk9_ok && echo "| **sbk -l 9** | $(fmt_size $sz_sbk9) | $(fmt_ratio $raw_bytes $sz_sbk9) | $(fmt_time $ms_sbk9_c) | $(fmt_time $ms_sbk9_d) |" || echo "| **sbk -l 9** | — | — | FAILED | — |"
+            $sbk1_ok && echo "| **sbk lzma2 -l 1** | $(fmt_size $sz_sbk1) | $(fmt_ratio $raw_bytes $sz_sbk1) | $(fmt_time $ms_sbk1_c) | $(fmt_time $ms_sbk1_d) |" || echo "| **sbk lzma2 -l 1** | — | — | FAILED | — |"
+            $sbk5_ok && echo "| **sbk lzma2 -l 5** | $(fmt_size $sz_sbk5) | $(fmt_ratio $raw_bytes $sz_sbk5) | $(fmt_time $ms_sbk5_c) | $(fmt_time $ms_sbk5_d) |" || echo "| **sbk lzma2 -l 5** | — | — | FAILED | — |"
+            $sbk9_ok  && echo "| **sbk lzma2 -l 9** | $(fmt_size $sz_sbk9)  | $(fmt_ratio $raw_bytes $sz_sbk9)  | $(fmt_time $ms_sbk9_c)  | $(fmt_time $ms_sbk9_d)  |" || echo "| **sbk lzma2 -l 9** | — | — | FAILED | — |"
+            $sbkz1_ok && echo "| **sbk zstd -l 1**  | $(fmt_size $sz_sbkz1) | $(fmt_ratio $raw_bytes $sz_sbkz1) | $(fmt_time $ms_sbkz1_c) | $(fmt_time $ms_sbkz1_d) |" || echo "| **sbk zstd -l 1**  | — | — | FAILED | — |"
+            $sbkz5_ok && echo "| **sbk zstd -l 5**  | $(fmt_size $sz_sbkz5) | $(fmt_ratio $raw_bytes $sz_sbkz5) | $(fmt_time $ms_sbkz5_c) | $(fmt_time $ms_sbkz5_d) |" || echo "| **sbk zstd -l 5**  | — | — | FAILED | — |"
+            $sbkz9_ok && echo "| **sbk zstd -l 9**  | $(fmt_size $sz_sbkz9) | $(fmt_ratio $raw_bytes $sz_sbkz9) | $(fmt_time $ms_sbkz9_c) | $(fmt_time $ms_sbkz9_d) |" || echo "| **sbk zstd -l 9**  | — | — | FAILED | — |"
             $zip1_ok && echo "| zip -1 | $(fmt_size $sz_zip1) | $(fmt_ratio $raw_bytes $sz_zip1) | $(fmt_time $ms_zip1_c) | $(fmt_time $ms_zip1_d) |" || echo "| zip -1 | — | — | FAILED | — |"
             $zip5_ok && echo "| zip -5 | $(fmt_size $sz_zip5) | $(fmt_ratio $raw_bytes $sz_zip5) | $(fmt_time $ms_zip5_c) | $(fmt_time $ms_zip5_d) |" || echo "| zip -5 | — | — | FAILED | — |"
             $zip9_ok && echo "| zip -9 | $(fmt_size $sz_zip9) | $(fmt_ratio $raw_bytes $sz_zip9) | $(fmt_time $ms_zip9_c) | $(fmt_time $ms_zip9_d) |" || echo "| zip -9 | — | — | FAILED | — |"

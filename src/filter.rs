@@ -1,9 +1,12 @@
 use std::path::PathBuf;
 
+use crate::format::header::Algorithm;
+
 pub struct CompressOptions {
     pub output: PathBuf,
     pub threads: usize,
-    pub level: u32,           // LZMA preset 1–9
+    pub level: u32,           // compression level 1–9
+    pub algorithm: Algorithm, // compression algorithm
     pub max_age: Option<u64>, // milliseconds; None = no relative age filter
     pub since: Option<i64>,   // millisecond Unix timestamp; None = no absolute filter
     pub patterns: FilterMode,

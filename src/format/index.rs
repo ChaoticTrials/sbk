@@ -1,7 +1,7 @@
-use std::io::{Read, Write};
-
 use crate::checksum::hash;
+use crate::codec::Codec;
 use crate::error::SbkError;
+use std::io::{Read, Write};
 
 /// One entry in the Index Block.
 #[derive(Debug, Clone)]
@@ -15,22 +15,20 @@ pub struct IndexEntry {
     pub file_checksum: u32,
 }
 
-/// Serialize all index entries and write as a compressed xz stream.
+/// Serialize all index entries and write as a compressed stream.
 /// Entries are written in the order provided (caller must sort by path first).
 pub fn write_index(
     entries: &[IndexEntry],
-    preset: u32,
+    codec: &dyn Codec,
+    level: u32,
     w: &mut impl Write,
 ) -> anyhow::Result<(u64, u64, u32)> {
     // Serialize raw index
     let raw = serialize_raw(entries);
     let raw_size = raw.len() as u64;
 
-    // Compress with xz
-    use std::io::Write as IoWrite;
-    let mut enc = xz2::write::XzEncoder::new(Vec::new(), preset);
-    enc.write_all(&raw)?;
-    let compressed = enc.finish()?;
+    // Compress using the provided codec
+    let compressed = codec.compress(&raw, level)?;
     let compressed_size = compressed.len() as u64;
     let checksum = hash(&compressed);
 
@@ -61,10 +59,14 @@ fn serialize_raw(entries: &[IndexEntry]) -> Vec<u8> {
 /// Maximum allowed compressed index size (256 MiB). Prevents OOM on corrupt headers.
 const MAX_INDEX_COMPRESSED_SIZE: u64 = 256 * 1024 * 1024;
 
+/// Maximum allowed raw (decompressed) index size (1 GiB). Prevents OOM decompression bombs.
+const MAX_INDEX_RAW_SIZE: u32 = 1024 * 1024 * 1024;
+
 /// Read and decompress the index block.
 /// `compressed_size` bytes will be read from `r` (which should be positioned at the index start).
 pub fn read_index(
     r: &mut impl Read,
+    codec: &dyn Codec,
     compressed_size: u64,
     expected_checksum: u32,
 ) -> anyhow::Result<Vec<IndexEntry>> {
@@ -84,11 +86,8 @@ pub fn read_index(
         return Err(SbkError::IndexChecksumMismatch.into());
     }
 
-    // Decompress
-    use std::io::Read as IoRead;
-    let mut dec = xz2::read::XzDecoder::new(&compressed[..]);
-    let mut raw = Vec::new();
-    dec.read_to_end(&mut raw)?;
+    // Decompress using the provided codec
+    let raw = codec.decompress(&compressed, MAX_INDEX_RAW_SIZE)?;
 
     parse_raw(&raw)
 }

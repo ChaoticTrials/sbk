@@ -7,6 +7,7 @@ use clap::Parser;
 use sbk::cli::{Cli, Commands};
 use sbk::error::SbkError;
 use sbk::filter::{CompressOptions, FilterMode};
+use sbk::format::header::Algorithm;
 
 fn main() {
     if let Err(e) = run() {
@@ -30,6 +31,7 @@ fn run() -> anyhow::Result<()> {
             include,
             include_session_lock,
             quiet,
+            algorithm: algorithm_str,
         } => {
             // Validation
             if let Some(age) = max_age {
@@ -53,6 +55,17 @@ fn run() -> anyhow::Result<()> {
                     world_dir.display()
                 ));
             }
+
+            // Parse algorithm
+            let algorithm = match algorithm_str.to_lowercase().as_str() {
+                "lzma2" => Algorithm::Lzma2,
+                "zstd" => Algorithm::Zstd,
+                other => {
+                    eprintln!("error: {}", SbkError::InvalidAlgorithm(other.to_string()));
+                    eprintln!("Valid values: lzma2, zstd");
+                    std::process::exit(1);
+                }
+            };
 
             // Build FilterMode
             let patterns = if !exclude.is_empty() {
@@ -95,6 +108,7 @@ fn run() -> anyhow::Result<()> {
                 output,
                 threads,
                 level,
+                algorithm,
                 max_age,
                 since,
                 patterns,

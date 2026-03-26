@@ -29,6 +29,10 @@ pub enum SbkError {
     InvalidMaxAge,
     #[error("--since must be a non-negative millisecond Unix timestamp")]
     InvalidSinceTimestamp,
+    #[error("Unsupported compression algorithm: {0}")]
+    UnsupportedAlgorithm(u8),
+    #[error("Invalid --algorithm value '{0}': expected 'lzma2' or 'zstd'")]
+    InvalidAlgorithm(String),
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 }

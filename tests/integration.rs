@@ -5,11 +5,10 @@ use std::path::Path;
 use filetime::FileTime;
 use flate2::write::{GzEncoder, ZlibEncoder};
 use flate2::Compression;
-use tempfile::TempDir;
-use xz2::write::XzEncoder;
-
 use sbk::error::SbkError;
 use sbk::filter::{capture_now_ms, CompressOptions, FilterMode};
+use sbk::format::header::Algorithm;
+use tempfile::TempDir;
 
 // ─── helper: build a minimal valid MCA file ─────────────────────────────────
 
@@ -107,6 +106,7 @@ fn default_opts(_world_dir: &Path, output: &Path) -> CompressOptions {
         output: output.to_path_buf(),
         threads: 2,
         level: 1, // fast compression for tests
+        algorithm: Algorithm::Lzma2,
         max_age: None,
         since: None,
         patterns: FilterMode::None,
@@ -777,11 +777,15 @@ fn test24_content_round_trip() {
 // ─── Helper: build a minimal valid archive from scratch ──────────────────────
 
 fn make_crafted_archive(archive_path: &Path, entry_path: &str) {
+    use sbk::codec;
     use sbk::format::frame_dir::{write_frame_dir, FrameDir};
-    use sbk::format::header::{write_header, write_placeholder, Header, HEADER_DISK_SIZE};
+    use sbk::format::header::{
+        write_header, write_placeholder, Algorithm, Header, HEADER_DISK_SIZE,
+    };
     use sbk::format::index::{write_index, IndexEntry};
-    use sbk::solid::compressor::FRAME_SIZE;
+    use sbk::solid::FRAME_SIZE;
 
+    let codec = codec::from_algorithm(Algorithm::Lzma2);
     let mut f = fs::File::create(archive_path).unwrap();
     write_placeholder(&mut f).unwrap();
 
@@ -801,7 +805,7 @@ fn make_crafted_archive(archive_path: &Path, entry_path: &str) {
         file_checksum: 0,
     }];
     let (index_compressed_size, index_raw_size, index_checksum) =
-        write_index(&entries, 1, &mut f).unwrap();
+        write_index(&entries, &*codec, 1, &mut f).unwrap();
 
     f.seek(SeekFrom::Start(0)).unwrap();
     write_header(
@@ -809,7 +813,7 @@ fn make_crafted_archive(archive_path: &Path, entry_path: &str) {
         &Header {
             format_version: 1,
             flags: 0,
-            reserved: 0,
+            algorithm: Algorithm::Lzma2,
             file_count: 1,
             frame_size_bytes: FRAME_SIZE,
             frame_dir_offset,
@@ -887,20 +891,25 @@ fn test27_malicious_frame_count_rejected() {
 
 #[test]
 fn test28_malicious_index_entry_count_rejected() {
+    use sbk::codec;
+    use sbk::format::header::Algorithm;
     use std::io::Cursor;
 
     // Craft a raw index claiming 20_000_000 entries (> MAX_INDEX_ENTRIES = 10_000_000)
     let mut raw = Vec::new();
     raw.extend_from_slice(&20_000_000u64.to_le_bytes());
 
-    let mut enc = XzEncoder::new(Vec::new(), 1);
-    enc.write_all(&raw).unwrap();
-    let compressed = enc.finish().unwrap();
+    let codec = codec::from_algorithm(Algorithm::Lzma2);
+    let compressed = codec.compress(&raw, 1).unwrap();
     let compressed_size = compressed.len() as u64;
     let checksum = sbk::checksum::hash(&compressed);
 
-    let result =
-        sbk::format::index::read_index(&mut Cursor::new(compressed), compressed_size, checksum);
+    let result = sbk::format::index::read_index(
+        &mut Cursor::new(compressed),
+        &*codec,
+        compressed_size,
+        checksum,
+    );
     assert!(result.is_err());
     let msg = result.unwrap_err().to_string();
     assert!(
@@ -914,11 +923,15 @@ fn test28_malicious_index_entry_count_rejected() {
 
 #[test]
 fn test29_malicious_index_compressed_size_rejected() {
+    use sbk::codec;
+    use sbk::format::header::Algorithm;
     use std::io::Cursor;
 
+    let codec = codec::from_algorithm(Algorithm::Lzma2);
     // 300 MiB > MAX_INDEX_COMPRESSED_SIZE (256 MiB)
     let huge: u64 = 300 * 1024 * 1024;
-    let result = sbk::format::index::read_index(&mut Cursor::new(Vec::<u8>::new()), huge, 0);
+    let result =
+        sbk::format::index::read_index(&mut Cursor::new(Vec::<u8>::new()), &*codec, huge, 0);
     assert!(result.is_err());
     let msg = result.unwrap_err().to_string();
     assert!(
@@ -978,4 +991,254 @@ fn test31_exclude_two_actual_patterns() {
     assert!(out_dir.join("level.dat").exists());
     assert!(out_dir.join("icon.png").exists());
     assert!(out_dir.join("advancements/player.json").exists());
+}
+
+// ── Header round-trip: lzma2 ─────────────────────────────────────────────
+#[test]
+fn header_roundtrip_lzma2() {
+    use sbk::format::header::{read_header, write_header, Algorithm, Header, HEADER_DISK_SIZE};
+    let h = Header {
+        format_version: 1,
+        flags: 0,
+        algorithm: Algorithm::Lzma2,
+        file_count: 42,
+        frame_size_bytes: 16 * 1024 * 1024,
+        frame_dir_offset: 79,
+        frame_dir_size: 24,
+        index_offset: 1024,
+        index_compressed_size: 512,
+        index_raw_size: 1024,
+        index_checksum: 0xDEADBEEF,
+    };
+    let mut buf = Vec::new();
+    write_header(&mut buf, &h).unwrap();
+    assert_eq!(buf.len(), HEADER_DISK_SIZE, "header must be 79 bytes");
+    let h2 = read_header(&mut std::io::Cursor::new(&buf)).unwrap();
+    assert_eq!(h2.algorithm, Algorithm::Lzma2);
+    assert_eq!(h2.file_count, 42);
+    assert_eq!(h2.frame_dir_offset, 79);
+    assert_eq!(h2.index_checksum, 0xDEADBEEF);
+}
+
+// ── Header round-trip: zstd ──────────────────────────────────────────────
+#[test]
+fn header_roundtrip_zstd() {
+    use sbk::format::header::{read_header, write_header, Algorithm, Header, HEADER_DISK_SIZE};
+    let h = Header {
+        format_version: 1,
+        flags: 0,
+        algorithm: Algorithm::Zstd,
+        file_count: 7,
+        frame_size_bytes: 16 * 1024 * 1024,
+        frame_dir_offset: 79,
+        frame_dir_size: 0,
+        index_offset: 200,
+        index_compressed_size: 100,
+        index_raw_size: 200,
+        index_checksum: 0xCAFEBABE,
+    };
+    let mut buf = Vec::new();
+    write_header(&mut buf, &h).unwrap();
+    assert_eq!(buf.len(), HEADER_DISK_SIZE);
+    assert_eq!(buf[10], 1u8, "byte 10 must be 1 for zstd");
+    let h2 = read_header(&mut std::io::Cursor::new(&buf)).unwrap();
+    assert_eq!(h2.algorithm, Algorithm::Zstd);
+}
+
+// ── Unknown algorithm byte rejected ─────────────────────────────────────
+#[test]
+fn unknown_algorithm_rejected() {
+    use sbk::checksum::hash;
+    use sbk::error::SbkError;
+    use sbk::format::header::{read_header, HEADER_DISK_SIZE, MAGIC};
+    let mut buf = [0u8; HEADER_DISK_SIZE];
+    buf[0..8].copy_from_slice(&MAGIC);
+    buf[8] = 1; // format_version
+    buf[10] = 99; // unknown algorithm
+                  // recompute header_checksum: hash of bytes 0..75 with 75..79 zeroed
+    let cs = hash(&buf[0..75]);
+    buf[75..79].copy_from_slice(&cs.to_le_bytes());
+    let result = read_header(&mut std::io::Cursor::new(&buf));
+    assert!(matches!(
+        result.unwrap_err().downcast::<SbkError>().unwrap(),
+        SbkError::UnsupportedAlgorithm(99)
+    ));
+}
+
+// ── Non-zero reserved bytes rejected ────────────────────────────────────
+#[test]
+fn nonzero_reserved_rejected() {
+    use sbk::checksum::hash;
+    use sbk::format::header::{read_header, HEADER_DISK_SIZE, MAGIC};
+    let mut buf = [0u8; HEADER_DISK_SIZE];
+    buf[0..8].copy_from_slice(&MAGIC);
+    buf[8] = 1; // format_version
+    buf[14] = 1; // non-zero reserved byte
+    let cs = hash(&buf[0..75]);
+    buf[75..79].copy_from_slice(&cs.to_le_bytes());
+    let result = read_header(&mut std::io::Cursor::new(&buf));
+    assert!(result.is_err(), "non-zero reserved bytes must be rejected");
+}
+
+// ── Full round-trip: lzma2 ───────────────────────────────────────────────
+#[test]
+fn full_roundtrip_lzma2() {
+    let world_dir = tempfile::tempdir().unwrap();
+    let out_dir = tempfile::tempdir().unwrap();
+    let archive = out_dir.path().join("test.sbk");
+    make_test_world(world_dir.path());
+    let opts = default_opts(world_dir.path(), &archive);
+    sbk::compress::compress(world_dir.path(), &opts).unwrap();
+    let extract_dir = tempfile::tempdir().unwrap();
+    sbk::extract::extract(&archive, &["**".to_string()], extract_dir.path(), 2).unwrap();
+    // Verify all files exist in extracted output.
+    // Note: JSON and MCA/NBT files are preprocessed (minified/re-encoded) during compression,
+    // so we only do byte-exact comparison for RAW group files (e.g. .png).
+    for entry in walkdir::WalkDir::new(world_dir.path())
+        .into_iter()
+        .filter_map(|e| e.ok())
+    {
+        if entry.file_type().is_file() {
+            let rel = entry.path().strip_prefix(world_dir.path()).unwrap();
+            let rel_str = rel.to_string_lossy().replace('\\', "/");
+            if rel_str == "session.lock" {
+                continue;
+            }
+            let extracted = extract_dir.path().join(rel);
+            assert!(extracted.exists(), "missing: {}", rel_str);
+            // Only byte-compare RAW files (non-preprocessed)
+            let ext = entry
+                .path()
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("");
+            if !["mca", "dat", "dat_old", "json"].contains(&ext) {
+                assert_eq!(
+                    std::fs::read(entry.path()).unwrap(),
+                    std::fs::read(&extracted).unwrap(),
+                    "content mismatch: {}",
+                    rel_str
+                );
+            }
+        }
+    }
+}
+
+// ── Full round-trip: zstd ────────────────────────────────────────────────
+#[test]
+fn full_roundtrip_zstd() {
+    use sbk::format::header::{read_header, Algorithm};
+    let world_dir = tempfile::tempdir().unwrap();
+    let out_dir = tempfile::tempdir().unwrap();
+    let archive = out_dir.path().join("test_zstd.sbk");
+    make_test_world(world_dir.path());
+    let mut opts = default_opts(world_dir.path(), &archive);
+    opts.algorithm = Algorithm::Zstd;
+    sbk::compress::compress(world_dir.path(), &opts).unwrap();
+    // verify algorithm byte in archive
+    let mut f = std::fs::File::open(&archive).unwrap();
+    let h = read_header(&mut f).unwrap();
+    assert_eq!(h.algorithm, Algorithm::Zstd);
+    // round-trip
+    let extract_dir = tempfile::tempdir().unwrap();
+    sbk::extract::extract(&archive, &["**".to_string()], extract_dir.path(), 2).unwrap();
+    for entry in walkdir::WalkDir::new(world_dir.path())
+        .into_iter()
+        .filter_map(|e| e.ok())
+    {
+        if entry.file_type().is_file() {
+            let rel = entry.path().strip_prefix(world_dir.path()).unwrap();
+            let rel_str = rel.to_string_lossy().replace('\\', "/");
+            if rel_str == "session.lock" {
+                continue;
+            }
+            let extracted = extract_dir.path().join(rel);
+            assert!(extracted.exists(), "missing: {}", rel_str);
+        }
+    }
+}
+
+// ── zstd archive: verify + info ──────────────────────────────────────────
+#[test]
+fn zstd_verify_and_info() {
+    use sbk::format::header::Algorithm;
+    let world_dir = tempfile::tempdir().unwrap();
+    let out_dir = tempfile::tempdir().unwrap();
+    let archive = out_dir.path().join("verify_zstd.sbk");
+    make_test_world(world_dir.path());
+    let mut opts = default_opts(world_dir.path(), &archive);
+    opts.algorithm = Algorithm::Zstd;
+    sbk::compress::compress(world_dir.path(), &opts).unwrap();
+    let ok = sbk::verify::verify(&archive, 2).unwrap();
+    assert!(ok, "verify must pass for valid zstd archive");
+}
+
+// ── Invalid --algorithm CLI value ────────────────────────────────────────
+#[test]
+fn invalid_algorithm_cli() {
+    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_sbk"));
+    let world_dir = tempfile::tempdir().unwrap();
+    let out_dir = tempfile::tempdir().unwrap();
+    let archive = out_dir.path().join("out.sbk");
+    let output = cmd
+        .args([
+            "compress",
+            world_dir.path().to_str().unwrap(),
+            "-o",
+            archive.to_str().unwrap(),
+            "--algorithm",
+            "bogus",
+        ])
+        .output()
+        .unwrap();
+    assert_ne!(output.status.code().unwrap_or(0), 0, "must exit non-zero");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    // Must mention valid options
+    assert!(
+        stderr.contains("lzma2") || stderr.contains("zstd"),
+        "error message must mention valid options, got: {stderr}"
+    );
+}
+
+// ── Algorithm byte covered by header checksum ────────────────────────────
+#[test]
+fn algorithm_byte_covered_by_checksum() {
+    use sbk::format::header::{read_header, Algorithm};
+    let world_dir = tempfile::tempdir().unwrap();
+    let out_dir = tempfile::tempdir().unwrap();
+    let archive = out_dir.path().join("flip_algo.sbk");
+    make_test_world(world_dir.path());
+    let mut opts = default_opts(world_dir.path(), &archive);
+    opts.algorithm = Algorithm::Zstd;
+    sbk::compress::compress(world_dir.path(), &opts).unwrap();
+    // Flip byte 10 from 1 (zstd) to 0 (lzma2) WITHOUT recomputing checksum
+    let mut data = std::fs::read(&archive).unwrap();
+    assert_eq!(data[10], 1u8);
+    data[10] = 0;
+    std::fs::write(&archive, &data).unwrap();
+    // Must fail with HeaderChecksumMismatch
+    use sbk::error::SbkError;
+    let mut f = std::fs::File::open(&archive).unwrap();
+    let err = read_header(&mut f).unwrap_err();
+    assert!(matches!(
+        err.downcast::<SbkError>().unwrap(),
+        SbkError::HeaderChecksumMismatch
+    ));
+}
+
+// ── Frame decompression bomb guard ──────────────────────────────────────
+#[test]
+fn frame_decompression_bomb_guard() {
+    use sbk::codec::from_algorithm;
+    use sbk::format::header::Algorithm;
+    // Build a payload that compresses small but decompresses large
+    // 200 bytes of actual data
+    let big_data = vec![0xAAu8; 200];
+    for algo in [Algorithm::Lzma2, Algorithm::Zstd] {
+        let codec = from_algorithm(algo);
+        let compressed = codec.compress(&big_data, 1).unwrap();
+        // Claim only 50 bytes expected — must fail
+        let result = codec.decompress(&compressed, 50);
+        assert!(result.is_err(), "bomb guard must reject for {:?}", algo);
+    }
 }

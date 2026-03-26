@@ -4,6 +4,7 @@ use std::io::SeekFrom;
 use std::path::Path;
 
 use crate::classify::Group;
+use crate::codec;
 use crate::format::frame_dir::read_frame_dir;
 use crate::format::header::read_header;
 use crate::format::index::read_index;
@@ -11,15 +12,22 @@ use crate::format::index::read_index;
 pub fn info(archive: &Path, list: bool) -> anyhow::Result<()> {
     let mut f = File::open(archive)?;
     let header = read_header(&mut f)?;
+    let codec = codec::from_algorithm(header.algorithm);
 
     f.seek(SeekFrom::Start(header.frame_dir_offset))?;
     let frame_dir = read_frame_dir(&mut f)?;
 
     f.seek(SeekFrom::Start(header.index_offset))?;
-    let entries = read_index(&mut f, header.index_compressed_size, header.index_checksum)?;
+    let entries = read_index(
+        &mut f,
+        &*codec,
+        header.index_compressed_size,
+        header.index_checksum,
+    )?;
 
     println!("SBK Archive: {}", archive.display());
     println!("  Format version: {}", header.format_version);
+    println!("  Algorithm:        {}", header.algorithm);
     println!("  Files stored:   {}", header.file_count);
     println!(
         "  Frame size:     {} MiB",

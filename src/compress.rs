@@ -8,6 +8,7 @@ use walkdir::WalkDir;
 
 use crate::checksum::hash;
 use crate::classify::{classify, Group};
+use crate::codec::{self, Codec};
 use crate::filter::{accept, capture_now_ms, CompressOptions};
 use crate::format::frame_dir::{write_frame_dir, FrameDir, FrameEntry};
 use crate::format::header::{write_header, write_placeholder, Header, HEADER_DISK_SIZE};
@@ -15,7 +16,7 @@ use crate::format::index::{write_index, IndexEntry};
 use crate::preprocess::json::preprocess_json_from_bytes;
 use crate::preprocess::mca::preprocess_mca_from_bytes;
 use crate::preprocess::nbt::preprocess_nbt_from_bytes;
-use crate::solid::compressor::{compress_frame_data, FRAME_SIZE};
+use crate::solid::FRAME_SIZE;
 
 struct FileInfo {
     abs_path: std::path::PathBuf,
@@ -24,14 +25,40 @@ struct FileInfo {
 }
 
 pub fn compress(world_dir: &Path, opts: &CompressOptions) -> anyhow::Result<()> {
+    compress_impl(world_dir, opts, |_, _, _| {}, false)
+}
+
+/// Compression with a progress callback for GUI use.
+/// `on_progress(completed, total, current_path)` is called after each file is processed.
+pub fn compress_with_progress<F>(
+    world_dir: &Path,
+    opts: &CompressOptions,
+    on_progress: F,
+) -> anyhow::Result<()>
+where
+    F: Fn(usize, usize, &str),
+{
+    compress_impl(world_dir, opts, on_progress, true)
+}
+
+fn compress_impl<F>(
+    world_dir: &Path,
+    opts: &CompressOptions,
+    on_file_preprocessed: F,
+    hide_bars: bool,
+) -> anyhow::Result<()>
+where
+    F: Fn(usize, usize, &str),
+{
     let now_ms = capture_now_ms();
+    let codec: Box<dyn Codec> = codec::from_algorithm(opts.algorithm);
 
     rayon::ThreadPoolBuilder::new()
         .num_threads(opts.threads)
         .build_global()
         .ok();
 
-    let mp = if opts.quiet {
+    let mp = if opts.quiet || hide_bars {
         MultiProgress::with_draw_target(ProgressDrawTarget::hidden())
     } else {
         MultiProgress::new()
@@ -121,6 +148,7 @@ pub fn compress(world_dir: &Path, opts: &CompressOptions) -> anyhow::Result<()> 
     let mut all_index_entries: Vec<IndexEntry> = Vec::new();
 
     let batch_size = opts.threads.max(1);
+    let mut files_done: usize = 0;
 
     for g in 0..4usize {
         let files = &files_by_group[g];
@@ -201,6 +229,7 @@ pub fn compress(world_dir: &Path, opts: &CompressOptions) -> anyhow::Result<()> 
                                 &mut out,
                                 &mut fd.groups[g],
                                 &mut frame_batch,
+                                &*codec,
                                 opts.level,
                                 current_offset,
                                 &bar_comp,
@@ -220,6 +249,8 @@ pub fn compress(world_dir: &Path, opts: &CompressOptions) -> anyhow::Result<()> 
                     file_checksum,
                 });
                 bar_pre.inc(1);
+                files_done += 1;
+                on_file_preprocessed(files_done, total_included as usize, &fi.rel_path);
             }
         }
 
@@ -233,6 +264,7 @@ pub fn compress(world_dir: &Path, opts: &CompressOptions) -> anyhow::Result<()> 
                 &mut out,
                 &mut fd.groups[g],
                 &mut frame_batch,
+                &*codec,
                 opts.level,
                 current_offset,
                 &bar_comp,
@@ -252,7 +284,7 @@ pub fn compress(world_dir: &Path, opts: &CompressOptions) -> anyhow::Result<()> 
     all_index_entries.sort_by(|a, b| a.path.cmp(&b.path));
     let index_offset = frame_dir_offset + frame_dir_size;
     let (index_compressed_size, index_raw_size, index_checksum) =
-        write_index(&all_index_entries, opts.level, &mut out)?;
+        write_index(&all_index_entries, &*codec, opts.level, &mut out)?;
 
     // === Seek back and write the final header ===
     out.seek(SeekFrom::Start(0))?;
@@ -264,7 +296,7 @@ pub fn compress(world_dir: &Path, opts: &CompressOptions) -> anyhow::Result<()> 
     let header = Header {
         format_version: 1,
         flags: 0,
-        reserved: 0,
+        algorithm: opts.algorithm,
         file_count: actual_file_count,
         frame_size_bytes: FRAME_SIZE,
         frame_dir_offset,
@@ -277,7 +309,7 @@ pub fn compress(world_dir: &Path, opts: &CompressOptions) -> anyhow::Result<()> 
     write_header(&mut out, &header)?;
 
     // === Print summary ===
-    if !opts.quiet {
+    if !opts.quiet && !hide_bars {
         println!(
             "Scanned {} files → included {}  ({} skipped by filters)",
             total_scanned, actual_file_count, skipped
@@ -300,14 +332,15 @@ fn flush_frame_batch(
     out: &mut impl Write,
     entries: &mut Vec<FrameEntry>,
     batch: &mut Vec<(Vec<u8>, u32)>,
-    preset: u32,
+    codec: &dyn Codec,
+    level: u32,
     mut current_offset: u64,
     bar: &ProgressBar,
 ) -> anyhow::Result<u64> {
     // Compress all frames in the batch concurrently.
     let compressed: Vec<Vec<u8>> = batch
         .par_iter()
-        .map(|(raw, _)| compress_frame_data(raw, preset))
+        .map(|(raw, _)| codec.compress(raw, level))
         .collect::<anyhow::Result<_>>()?;
 
     // Write in order so frame offsets are correct.

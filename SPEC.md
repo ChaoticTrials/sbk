@@ -167,7 +167,8 @@ error: --exclude and --include are mutually exclusive; use one or the other
 pub struct CompressOptions {
     pub output:               PathBuf,
     pub threads:              usize,
-    pub level:                u32,           // LZMA preset 1–9
+    pub level:                u32,           // compression level 1–9 (mapped internally per algorithm)
+    pub algorithm:            Algorithm,     // lzma2 (default) or zstd
     pub max_age:              Option<u64>,   // milliseconds; None = no relative age filter
     pub since:                Option<i64>,   // millisecond Unix timestamp; None = no absolute filter
     pub patterns:             FilterMode,
@@ -313,11 +314,18 @@ Parse with `serde_json` into `serde_json::Value`, serialize compactly with `serd
 
 ### 5.6 Frame-Based Solid Blocks
 
-Files within the same group are concatenated into one **solid stream** and compressed together, allowing LZMA to exploit repetition across all files in that group. The solid stream is split into fixed-size **frames** before compression. Each frame is LZMA2-compressed **independently**, enabling selective extraction without decompressing the full archive.
+Files within the same group are concatenated into one **solid stream** and compressed together, exploiting repetition across all files in that group. The solid stream is split into fixed-size **frames** before compression. Each frame is compressed **independently**, enabling selective extraction without decompressing the full archive.
 
 **Frame size: 16 MiB uncompressed** (`FRAME_SIZE: u64 = 16 * 1024 * 1024`). Stored in the fixed header for forward compatibility.
 
-**Compression: LZMA2** via `xz2::write::XzEncoder` at the user-specified preset (1–9, default 9). Preset 9 uses a 64 MiB sliding dictionary, which vastly outperforms Minecraft's per-chunk 32 KB window. All frames across all groups are compressed in parallel.
+**Compression algorithm** is selected via `--algorithm` (default: `lzma2`):
+
+| Algorithm | Flag value | Notes |
+|-----------|-----------|-------|
+| LZMA2     | `lzma2`   | `xz2::write::XzEncoder` at preset 1–9. Preset 9 uses a 64 MiB dictionary, vastly outperforming Minecraft's per-chunk 32 KB window. Best compression ratio. |
+| Zstandard | `zstd`    | `zstd` crate. User level 1–9 is mapped to internal levels 3–19 (`(level * 2 + 1).min(22)`). Significantly faster compression and decompression at slightly lower ratios. |
+
+All frames across all groups and the index block use the **same algorithm**. The algorithm is stored in the header at byte 10 and verified before any data is read.
 
 ### 5.7 MCAP Reconstruction (Decompression)
 
@@ -337,7 +345,7 @@ Files within the same group are concatenated into one **solid stream** and compr
 
 ```
 [File Magic]        8 bytes
-[Fixed Header]      68 bytes
+[Fixed Header]      71 bytes
 [Data Blocks]       variable   (frame data for all 4 groups, consecutive)
 [Frame Directory]   variable   (written after data; offset stored in Fixed Header)
 [Index Block]       variable   (written last; offset stored in Fixed Header)
@@ -355,29 +363,40 @@ Bytes 0–7:  53 42 4B 21 56 31 0D 0A   →   "SBK!V1\r\n"
 
 The `\r\n` suffix detects accidental line-ending conversion.
 
-### 6.3 Fixed Header (bytes 8–75, 68 bytes)
+### 6.3 Fixed Header (bytes 8–78, 71 bytes)
 
 ```
-Relative  Size  Type    Field
+Relative  Size  Type      Field
 offset
---------  ----  ------  -----
-0         1     u8      format_version          currently = 1
-1         1     u8      flags                   reserved, must be 0
-2         2     u16     reserved                must be 0
-4         8     u64     file_count              total files stored in this archive
-12        8     u64     frame_size_bytes        uncompressed frame size (= 16777216)
-20        8     u64     frame_dir_offset        absolute byte offset of Frame Directory
-28        8     u64     frame_dir_size          byte size of Frame Directory on disk
-36        8     u64     index_offset            absolute byte offset of Index Block
-44        8     u64     index_compressed_size   compressed byte size of Index Block
-52        8     u64     index_raw_size          uncompressed byte size of Index Block
-60        4     u32     index_checksum          xxHash32 of the compressed index bytes
-64        4     u32     header_checksum         xxHash32 of bytes 0–71 (this field = 0 during compute)
+--------  ----  --------  -----
+0         1     u8        format_version          currently = 1
+1         1     u8        flags                   reserved bitmask, must be 0
+2         1     u8        compression_algorithm   0 = lzma2  1 = zstd  2–255 = reserved
+3         4     [u8; 4]   reserved                must be 0x00000000
+7         8     u64       file_count              total files stored in this archive
+15        8     u64       frame_size_bytes        uncompressed frame size (= 16777216)
+23        8     u64       frame_dir_offset        absolute byte offset of Frame Directory
+31        8     u64       frame_dir_size          byte size of Frame Directory on disk
+39        8     u64       index_offset            absolute byte offset of Index Block
+47        8     u64       index_compressed_size   compressed byte size of Index Block
+55        8     u64       index_raw_size          uncompressed byte size of Index Block
+63        4     u32       index_checksum          xxHash32 of the compressed index bytes
+67        4     u32       header_checksum         xxHash32 of bytes 0–74 (this field = 0 during compute)
 ```
 
-Total on disk: 8 bytes magic + 68 bytes header = **76 bytes** before the Frame Directory.
+Total on disk: 8 bytes magic + 71 bytes header = **79 bytes** before the Frame Directory.
 
-**Computing `header_checksum`:** zero the 4 bytes at relative offset 64 (absolute bytes 72–75), compute xxHash32 over bytes 0–71 (72 bytes — covering all fields including `index_checksum`), write the result back at offset 64.
+**Computing `header_checksum`:** zero the 4 bytes at relative offset 67 (absolute bytes 75–78), compute xxHash32 over bytes 0–74 (75 bytes — covering all fields including `index_checksum` and `compression_algorithm`), write the result back at offset 67.
+
+**Algorithm values:**
+
+| Byte value | Algorithm | Codec used |
+|-----------|-----------|------------|
+| `0` | `lzma2` | `xz2::write::XzEncoder` / `xz2::read::XzDecoder` |
+| `1` | `zstd`  | `zstd::stream::write::Encoder` / `zstd::stream::read::Decoder` |
+| 2–255 | (reserved) | Reading must return `SbkError::UnsupportedAlgorithm(n)` |
+
+The same algorithm applies uniformly to **all frames and the index block**. There is no per-frame algorithm field.
 
 ### 6.4 Frame Directory (at `frame_dir_offset`)
 
@@ -397,11 +416,11 @@ Per-frame entry size: 20 bytes. An empty group contributes only the 4-byte `fram
 
 ### 6.5 Data Blocks
 
-Compressed frame payloads for all groups in group order (0, 1, 2, 3), frames within each group in ascending frame-index order. `frame_offset` fields are absolute byte offsets into the file. Each frame is an independent xz/LZMA2 stream; decompress with `xz2::read::XzDecoder` on exactly `frame_compressed_sz` bytes.
+Compressed frame payloads for all groups in group order (0, 1, 2, 3), frames within each group in ascending frame-index order. `frame_offset` fields are absolute byte offsets into the file. Each frame is an independent compressed stream using the algorithm from the Fixed Header (`compression_algorithm` byte). Decompress exactly `frame_compressed_sz` bytes.
 
 ### 6.6 Index Block (at `index_offset`)
 
-Written last so all frame offsets are known. Compressed as a single xz stream. Raw (pre-compression) content:
+Written last so all frame offsets are known. Compressed as a single stream using the same algorithm as the data frames (from the Fixed Header). Raw (pre-compression) content:
 
 ```
 [entry_count: u64]
@@ -448,11 +467,11 @@ Stage 2 [streaming, per group]   — frame assembly + compression + writing
   Files within each group are preprocessed in parallel batches of N (= thread count).
   Preprocessed bytes are drained in sorted order into a 16 MiB frame buffer.
   When the frame buffer reaches FRAME_SIZE, the frame is added to a compression batch.
-  When the compression batch reaches N frames, all N are LZMA2-compressed in parallel
-  and written to disk in order. This bounds peak memory to O(N × FRAME_SIZE).
+  When the compression batch reaches N frames, all N are compressed in parallel
+  using the selected codec and written to disk in order. This bounds peak memory to O(N × FRAME_SIZE).
 
 Stage 3 [single-threaded, I/O bound]   — finalize
-  1. Write 76 placeholder zero bytes for Fixed Header.
+  1. Write 79 placeholder zero bytes for Fixed Header.
   2. Stream frame data for groups 0 → 3 (interleaved with Stage 2 above).
   3. Write Frame Directory (now fully known) immediately after the last frame.
   4. Compress Index Block as a single xz stream; write it; record offset and sizes.
@@ -552,8 +571,9 @@ USAGE:
 COMPRESS OPTIONS:
   -o, --output  <file.sbk>           Default: <world_dir_name>.sbk in current dir
   -t, --threads <n>                  Default: logical CPU count
-  -l, --level   <1-9>                LZMA preset; default 9
-      --max-age  <ms>                Skip files not modified within the last N milliseconds
+  -l, --level     <1-9>              Compression level; default 9. For zstd, mapped to 3–19 internally.
+      --algorithm <lzma2|zstd>       Compression algorithm; default lzma2
+      --max-age   <ms>               Skip files not modified within the last N milliseconds
       --since    <timestamp>         Skip files with mtime below this millisecond Unix timestamp
       --exclude  <pattern>...        Skip files matching any of these glob patterns
       --include  <pattern>...        Include ONLY files matching any of these glob patterns
@@ -590,7 +610,8 @@ Before opening any files, validate:
 3. `--exclude` and `--include` are not both present.
 4. All glob patterns in `--exclude` / `--include` are syntactically valid. Error and list all invalid patterns if any fail.
 5. `--level` is in range 1–9.
-6. `world_dir` exists and is a directory.
+6. `--algorithm` is `lzma2` or `zstd` (case-insensitive). Unknown values produce `SbkError::InvalidAlgorithm` and exit 1.
+7. `world_dir` exists and is a directory.
 
 These checks all run before the Rayon pool is created and before `walkdir` traversal begins. `capture_now_ms()` is called only after all validation passes.
 
@@ -617,11 +638,19 @@ If `--since` was used:
 
 Benchmarks on a typical survival world (~1 GB):
 
-| Method                   | Output size     | Notes                                     |
-|--------------------------|-----------------|-------------------------------------------|
-| Raw `.tar`               | ~1000 MB        | no compression                            |
-| `tar.gz` (gzip -9)       | ~750 MB         | per-file, small window                    |
-| `tar.xz` (LZMA preset 9) | ~640 MB         | solid, best generic baseline              |
-| **SBK**                  | **~570–610 MB** | MCA stripping + Hilbert sort + solid LZMA |
+| Method                        | Output size     | Notes                                              |
+|-------------------------------|-----------------|---------------------------------------------------|
+| Raw `.tar`                    | ~1000 MB        | no compression                                    |
+| `tar.gz` (gzip -9)            | ~750 MB         | per-file, small window                            |
+| `tar.xz` (LZMA preset 9)      | ~640 MB         | solid, best generic baseline                      |
+| **SBK lzma2 -l 9** (default)  | **~570–610 MB** | MCA stripping + Hilbert sort + solid LZMA2        |
+| **SBK zstd -l 9**             | **~590–630 MB** | same preprocessing; slightly larger, much faster  |
+| **SBK zstd -l 1**             | **~640–680 MB** | fastest compress/decompress option                |
+
+**Algorithm trade-offs:**
+
+- `lzma2` achieves the best compression ratios at the cost of slower compression. Use for archival where space matters most.
+- `zstd` compresses and decompresses significantly faster (often 3–10× on compression, 2–5× on decompression). Ratios are slightly worse, but still well ahead of `tar.xz` thanks to MCA preprocessing.
+- Both algorithms benefit equally from the MCA chunk stripping and Hilbert sort preprocessing.
 
 Using `--max-age` or `--exclude` on rarely-visited dimensions (e.g., `--exclude "DIM-1/**"`) reduces output size proportionally.
