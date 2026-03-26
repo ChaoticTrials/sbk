@@ -11,112 +11,84 @@
 ## Commands Used
 
 ```bash
-# SBK (sbk 0.1.0) — lzma2 (default)
-sbk compress <world> -o <world>.sbk -l 1 -t 16
-sbk compress <world> -o <world>.sbk -l 5 -t 16
-sbk compress <world> -o <world>.sbk -l 9 -t 16
+# SBK (sbk 0.1.0) — lzma2 levels 1–9
+sbk compress <world> -o <world>.sbk --algorithm lzma2 -l <1-9> -t 16
 sbk decompress <world>.sbk -o <out_dir>/ -t 16
 
-# SBK (sbk 0.1.0) — zstd
-sbk compress <world> -o <world>.sbk --algorithm zstd -l 1 -t 16
-sbk compress <world> -o <world>.sbk --algorithm zstd -l 5 -t 16
-sbk compress <world> -o <world>.sbk --algorithm zstd -l 9 -t 16
+# SBK (sbk 0.1.0) — zstd levels 1–9
+sbk compress <world> -o <world>.sbk --algorithm zstd -l <1-9> -t 16
 sbk decompress <world>.sbk -o <out_dir>/ -t 16
 
-# zip
-zip -1 -r <world>.zip <world>/
-zip -5 -r <world>.zip <world>/
-zip -9 -r <world>.zip <world>/
+# zip (default level)
+zip -r <world>.zip <world>/
 unzip -q <world>.zip -d <out_dir>/
 
-# tar.xz
-tar -cJf <world>.tar.xz <world>/
-tar -xJf <world>.tar.xz -C <out_dir>/
+# tar.gz (default level)
+tar -czf <world>.tar.gz <world>/
+tar -xzf <world>.tar.gz -C <out_dir>/
 
-# 7z
-7z a -mx=1 <world>.7z <world>/
-7z a -mx=5 <world>.7z <world>/
-7z a -mx=9 <world>.7z <world>/
+# 7z (default level)
+7z a <world>.7z <world>/
 7z x <world>.7z -o<out_dir>/
 ```
 
+> ★ marks the sbk variant with the best compression×speed score (smallest ratio × compress time).
+
 ## Results
 
-### 10  _(Minecraft 1.21.1)_
-
-| Method | Size | Ratio | Compress | Decompress |
-|--------|-----:|------:|---------:|-----------:|
-| Uncompressed | 12,7 MB | 100% | — | — |
-| **sbk lzma2 -l 1** | 3,1 MB | 24,2% | 0,28s | 0,13s |
-| **sbk lzma2 -l 5** | 2,7 MB | 21,2% | 1,49s | 0,12s |
-| **sbk lzma2 -l 9** | 2,6 MB  | 20,1%  | 2,24s  | 0,13s  |
-| **sbk zstd -l 1**  | 4,0 MB | 31,4% | 0,07s | 0,07s |
-| **sbk zstd -l 5**  | 3,2 MB | 24,9% | 0,27s | 0,08s |
-| **sbk zstd -l 9**  | 2,7 MB | 21,4% | 2,54s | 0,08s |
-| zip -1 | 6,5 MB | 51,6% | 0,13s | 0,05s |
-| zip -5 | 6,5 MB | 51,4% | 0,14s | 0,06s |
-| zip -9 | 6,5 MB | 51,4% | 0,17s | 0,06s |
-| tar.xz | 5,6 MB | 44,4% | 0,99s | 0,22s |
-| 7z -mx=1 | 6,2 MB | 49,2% | 0,09s | 0,04s |
-| 7z -mx=5 | 5,6 MB | 44,2% | 0,33s | 0,21s |
-| 7z -mx=9 | 5,6 MB | 44,2% | 0,34s | 0,22s |
-
-### 50  _(Minecraft 1.21.1)_
-
-| Method | Size | Ratio | Compress | Decompress |
-|--------|-----:|------:|---------:|-----------:|
-| Uncompressed | 129,3 MB | 100% | — | — |
-| **sbk lzma2 -l 1** | 59,2 MB | 45,8% | 1,82s | 1,73s |
-| **sbk lzma2 -l 5** | 53,3 MB | 41,2% | 7,39s | 1,11s |
-| **sbk lzma2 -l 9** | 50,6 MB  | 39,1%  | 11,39s  | 1,32s  |
-| **sbk zstd -l 1**  | 79,3 MB | 61,3% | 0,72s | 1,00s |
-| **sbk zstd -l 5**  | 63,9 MB | 49,4% | 1,90s | 1,00s |
-| **sbk zstd -l 9**  | 54,4 MB | 42,0% | 14,96s | 1,01s |
-| zip -1 | 94,4 MB | 73,0% | 1,79s | 0,55s |
-| zip -5 | 94,3 MB | 72,9% | 1,90s | 0,59s |
-| zip -9 | 94,2 MB | 72,9% | 2,11s | 0,58s |
-| tar.xz | 90,1 MB | 69,7% | 19,38s | 3,52s |
-| 7z -mx=1 | 93,6 MB | 72,4% | 0,60s | 0,38s |
-| 7z -mx=5 | 89,6 MB | 69,3% | 3,25s | 1,75s |
-| 7z -mx=9 | 88,6 MB | 68,5% | 9,34s | 3,25s |
-
-### 10  _(Minecraft 26.1)_
-
-| Method | Size | Ratio | Compress | Decompress |
-|--------|-----:|------:|---------:|-----------:|
-| Uncompressed | 37,7 MB | 100% | — | — |
-| **sbk lzma2 -l 1** | 15,2 MB | 40,3% | 0,52s | 0,34s |
-| **sbk lzma2 -l 5** | 13,8 MB | 36,5% | 2,37s | 0,33s |
-| **sbk lzma2 -l 9** | 13,0 MB  | 34,6%  | 3,54s  | 0,34s  |
-| **sbk zstd -l 1**  | 20,2 MB | 53,5% | 0,22s | 0,27s |
-| **sbk zstd -l 5**  | 16,4 MB | 43,6% | 0,56s | 0,29s |
-| **sbk zstd -l 9**  | 13,9 MB | 36,8% | 4,65s | 0,28s |
-| zip -1 | 22,3 MB | 59,1% | 0,42s | 0,16s |
-| zip -5 | 22,2 MB | 58,9% | 0,45s | 0,17s |
-| zip -9 | 22,2 MB | 58,9% | 0,54s | 0,17s |
-| tar.xz | 21,7 MB | 57,5% | 4,00s | 0,87s |
-| 7z -mx=1 | 22,0 MB | 58,2% | 0,17s | 0,09s |
-| 7z -mx=5 | 21,7 MB | 57,4% | 1,08s | 0,82s |
-| 7z -mx=9 | 21,6 MB | 57,4% | 1,12s | 0,82s |
-
-### 50  _(Minecraft 26.1)_
+### 120 MB  _(Minecraft 26.1)_
 
 | Method | Size | Ratio | Compress | Decompress |
 |--------|-----:|------:|---------:|-----------:|
 | Uncompressed | 115,3 MB | 100% | — | — |
-| **sbk lzma2 -l 1** | 54,3 MB | 47,1% | 1,64s | 1,11s |
-| **sbk lzma2 -l 5** | 49,2 MB | 42,7% | 7,51s | 1,08s |
-| **sbk lzma2 -l 9** | 46,6 MB  | 40,4%  | 11,11s  | 1,09s  |
-| **sbk zstd -l 1**  | 72,1 MB | 62,5% | 0,64s | 0,93s |
-| **sbk zstd -l 5**  | 58,8 MB | 51,0% | 1,75s | 0,92s |
-| **sbk zstd -l 9**  | 49,7 MB | 43,1% | 14,60s | 0,97s |
-| zip -1 | 79,4 MB | 68,9% | 1,47s | 0,48s |
-| zip -5 | 79,2 MB | 68,7% | 1,55s | 0,52s |
-| zip -9 | 79,2 MB | 68,7% | 1,80s | 0,52s |
-| tar.xz | 78,1 MB | 67,8% | 15,54s | 3,09s |
-| 7z -mx=1 | 78,9 MB | 68,5% | 0,49s | 0,29s |
-| 7z -mx=5 | 78,1 MB | 67,8% | 2,57s | 1,66s |
-| 7z -mx=9 | 78,0 MB | 67,6% | 6,97s | 2,94s |
+| **sbk lzma2 -l 1** | 54,3 MB | 47,1% | 1,63s | 0,76s |
+| **sbk lzma2 -l 2** | 53,9 MB | 46,7% | 1,97s | 0,74s |
+| **sbk lzma2 -l 3** | 53,7 MB | 46,6% | 2,65s | 0,75s |
+| **sbk lzma2 -l 4** | 52,8 MB | 45,8% | 4,71s | 0,76s |
+| **sbk lzma2 -l 5** | 49,2 MB | 42,7% | 6,96s | 0,74s |
+| **sbk lzma2 -l 6** | 46,7 MB | 40,5% | 9,72s | 0,73s |
+| **sbk lzma2 -l 7** | 46,6 MB | 40,4% | 10,34s | 0,72s |
+| **sbk lzma2 -l 8** | 46,6 MB | 40,4% | 10,57s | 0,76s |
+| **sbk lzma2 -l 9** | 46,6 MB | 40,4% | 10,56s | 0,77s |
+| **sbk zstd -l 1** | 72,1 MB | 62,5% | 0,69s | 0,60s |
+| **sbk zstd -l 2** | 67,4 MB | 58,4% | 0,78s | 0,60s |
+| **sbk zstd -l 3** | 61,1 MB | 53,0% | 0,98s | 0,58s |
+| **sbk zstd -l 4** | 60,0 MB | 52,0% | 1,16s | 0,59s |
+| **sbk zstd -l 5** | 58,8 MB | 51,0% | 1,66s | 0,57s |
+| **sbk zstd -l 6** | 58,7 MB | 50,9% | 2,28s | 0,60s |
+| **sbk zstd -l 7** | 57,3 MB | 49,7% | 3,93s | 0,58s |
+| **sbk zstd -l 8** | 52,9 MB | 45,9% | 5,70s | 0,58s |
+| **sbk zstd -l 9** | 49,7 MB | 43,1% | 13,54s | 0,58s |
+| zip      | 79,2 MB | 68,7% | 1,56s | 0,51s |
+| tar.gz   | 79,2 MB | 68,7% | 1,62s | 0,47s |
+| 7z       | 78,1 MB  | 67,8%  | 2,38s  | 1,62s  |
+
+### 1 GB  _(Minecraft 26.1)_
+
+| Method | Size | Ratio | Compress | Decompress |
+|--------|-----:|------:|---------:|-----------:|
+| Uncompressed | 955,0 MB | 100% | — | — |
+| **sbk lzma2 -l 1** | 505,3 MB | 52,9% | 10,85s | 5,45s |
+| **sbk lzma2 -l 2** | 500,9 MB | 52,5% | 13,84s | 5,43s |
+| **sbk lzma2 -l 3** | 499,8 MB | 52,3% | 18,77s | 5,49s |
+| **sbk lzma2 -l 4** | 491,3 MB | 51,4% | 34,75s | 5,62s |
+| **sbk lzma2 -l 5** | 459,3 MB | 48,1% | 52,79s | 5,51s |
+| **sbk lzma2 -l 6** | 435,6 MB | 45,6% | 1m 14s | 5,42s |
+| **sbk lzma2 -l 7** | 435,1 MB | 45,6% | 1m 17s | 5,49s |
+| **sbk lzma2 -l 8** | 435,1 MB | 45,6% | 1m 20s | 5,69s |
+| **sbk lzma2 -l 9** | 435,1 MB | 45,6% | 1m 20s | 5,60s |
+| **sbk zstd -l 1** | 676,4 MB | 70,8% | 3,71s | 4,63s |
+| **sbk zstd -l 2** | 633,3 MB | 66,3% | 4,81s | 4,55s |
+| **sbk zstd -l 3** | 571,9 MB | 59,9% | 6,24s | 4,23s |
+| **sbk zstd -l 4** | 561,7 MB | 58,8% | 7,68s | 4,34s |
+| **sbk zstd -l 5** | 551,1 MB | 57,7% | 12,64s | 4,36s |
+| **sbk zstd -l 6** | 549,7 MB | 57,6% | 17,02s | 4,46s |
+| **sbk zstd -l 7** | 537,6 MB | 56,3% | 31,95s | 4,49s |
+| **sbk zstd -l 8** | 496,9 MB | 52,0% | 48,07s | 4,73s |
+| **sbk zstd -l 9** | 466,3 MB | 48,8% | 1m 55s | 5,02s |
+| zip      | 708,1 MB | 74,1% | 13,90s | 4,30s |
+| tar.gz   | 708,0 MB | 74,1% | 14,25s | 3,90s |
+| 7z       | 703,4 MB  | 73,7%  | 10,97s  | 3,21s  |
 
 ---
 
@@ -143,4 +115,4 @@ tar -xJf <world>.tar.xz -C <out_dir>/
    ```
 
 Results are written to `BENCHMARK.md`.
-Requires: `zip`, `unzip`. Optional: `tar`/`xz` (`sudo apt install xz-utils`), `7z` (`sudo apt install p7zip-full`).
+Requires: `zip`, `unzip`. Optional: `tar` (for tar.gz), `7z` (`sudo apt install p7zip-full`).
