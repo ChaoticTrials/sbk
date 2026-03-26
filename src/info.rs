@@ -60,18 +60,18 @@ pub fn info(archive: &Path, list: bool) -> anyhow::Result<()> {
     }
 
     if list {
-        println!("\nFile manifest:");
+        let world_name = archive.file_stem().unwrap_or_default().to_string_lossy();
+
+        let root = crate::tree::build(&entries);
+        crate::tree::print(&root, &world_name);
+
+        let total_size: u64 = entries.iter().map(|e| e.original_size).sum();
+        println!();
         println!(
-            "{:<60} {:>12} {:>5} {:>20}",
-            "Path", "Original", "Grp", "mtime_ms"
+            "{} files  ·  {} original",
+            entries.len(),
+            crate::tree::human_size(total_size)
         );
-        println!("{}", "-".repeat(100));
-        for e in &entries {
-            println!(
-                "{:<60} {:>12} {:>5} {:>20}",
-                e.path, e.original_size, e.group_id, e.mtime_ms,
-            );
-        }
         println!("\nNote: files excluded during compression are absent from this archive.");
     }
 

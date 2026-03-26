@@ -12,4 +12,5 @@ pub mod hilbert;
 pub mod info;
 pub mod preprocess;
 pub mod solid;
+pub mod tree;
 pub mod verify;
