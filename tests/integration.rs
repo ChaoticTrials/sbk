@@ -3,10 +3,10 @@ use std::io::{Seek, SeekFrom, Write};
 use std::path::Path;
 
 use filetime::FileTime;
-use flate2::write::{GzEncoder, ZlibEncoder};
 use flate2::Compression;
+use flate2::write::{GzEncoder, ZlibEncoder};
 use sbk::error::SbkError;
-use sbk::filter::{capture_now_ms, CompressOptions, FilterMode};
+use sbk::filter::{CompressOptions, FilterMode, capture_now_ms};
 use sbk::format::header::Algorithm;
 use tempfile::TempDir;
 
@@ -778,11 +778,11 @@ fn test24_content_round_trip() {
 
 fn make_crafted_archive(archive_path: &Path, entry_path: &str) {
     use sbk::codec;
-    use sbk::format::frame_dir::{write_frame_dir, FrameDir};
+    use sbk::format::frame_dir::{FrameDir, write_frame_dir};
     use sbk::format::header::{
-        write_header, write_placeholder, Algorithm, Header, HEADER_DISK_SIZE,
+        Algorithm, HEADER_DISK_SIZE, Header, write_header, write_placeholder,
     };
-    use sbk::format::index::{write_index, IndexEntry};
+    use sbk::format::index::{IndexEntry, write_index};
     use sbk::solid::FRAME_SIZE;
 
     let codec = codec::from_algorithm(Algorithm::Lzma2);
@@ -996,7 +996,7 @@ fn test31_exclude_two_actual_patterns() {
 // ── Header round-trip: lzma2 ─────────────────────────────────────────────
 #[test]
 fn header_roundtrip_lzma2() {
-    use sbk::format::header::{read_header, write_header, Algorithm, Header, HEADER_DISK_SIZE};
+    use sbk::format::header::{Algorithm, HEADER_DISK_SIZE, Header, read_header, write_header};
     let h = Header {
         format_version: 1,
         flags: 0,
@@ -1023,7 +1023,7 @@ fn header_roundtrip_lzma2() {
 // ── Header round-trip: zstd ──────────────────────────────────────────────
 #[test]
 fn header_roundtrip_zstd() {
-    use sbk::format::header::{read_header, write_header, Algorithm, Header, HEADER_DISK_SIZE};
+    use sbk::format::header::{Algorithm, HEADER_DISK_SIZE, Header, read_header, write_header};
     let h = Header {
         format_version: 1,
         flags: 0,
@@ -1050,12 +1050,12 @@ fn header_roundtrip_zstd() {
 fn unknown_algorithm_rejected() {
     use sbk::checksum::hash;
     use sbk::error::SbkError;
-    use sbk::format::header::{read_header, HEADER_DISK_SIZE, MAGIC};
+    use sbk::format::header::{HEADER_DISK_SIZE, MAGIC, read_header};
     let mut buf = [0u8; HEADER_DISK_SIZE];
     buf[0..8].copy_from_slice(&MAGIC);
     buf[8] = 1; // format_version
     buf[10] = 99; // unknown algorithm
-                  // recompute header_checksum: hash of bytes 0..75 with 75..79 zeroed
+    // recompute header_checksum: hash of bytes 0..75 with 75..79 zeroed
     let cs = hash(&buf[0..75]);
     buf[75..79].copy_from_slice(&cs.to_le_bytes());
     let result = read_header(&mut std::io::Cursor::new(&buf));
@@ -1069,7 +1069,7 @@ fn unknown_algorithm_rejected() {
 #[test]
 fn nonzero_reserved_rejected() {
     use sbk::checksum::hash;
-    use sbk::format::header::{read_header, HEADER_DISK_SIZE, MAGIC};
+    use sbk::format::header::{HEADER_DISK_SIZE, MAGIC, read_header};
     let mut buf = [0u8; HEADER_DISK_SIZE];
     buf[0..8].copy_from_slice(&MAGIC);
     buf[8] = 1; // format_version
@@ -1127,7 +1127,7 @@ fn full_roundtrip_lzma2() {
 // ── Full round-trip: zstd ────────────────────────────────────────────────
 #[test]
 fn full_roundtrip_zstd() {
-    use sbk::format::header::{read_header, Algorithm};
+    use sbk::format::header::{Algorithm, read_header};
     let world_dir = tempfile::tempdir().unwrap();
     let out_dir = tempfile::tempdir().unwrap();
     let archive = out_dir.path().join("test_zstd.sbk");
@@ -1203,7 +1203,7 @@ fn invalid_algorithm_cli() {
 // ── Algorithm byte covered by header checksum ────────────────────────────
 #[test]
 fn algorithm_byte_covered_by_checksum() {
-    use sbk::format::header::{read_header, Algorithm};
+    use sbk::format::header::{Algorithm, read_header};
     let world_dir = tempfile::tempdir().unwrap();
     let out_dir = tempfile::tempdir().unwrap();
     let archive = out_dir.path().join("flip_algo.sbk");

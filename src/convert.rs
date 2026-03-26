@@ -11,7 +11,7 @@ use crate::codec;
 use crate::error::SbkError;
 use crate::format::frame_dir::read_frame_dir;
 use crate::format::header::read_header;
-use crate::format::index::{read_index, IndexEntry};
+use crate::format::index::{IndexEntry, read_index};
 use crate::preprocess::{mca::reconstruct_mca_bytes, nbt::reconstruct_nbt_bytes};
 use crate::solid::extractor::slice_from_frames;
 
@@ -224,8 +224,8 @@ fn write_zip<W: Write + Seek>(
     frame_size: u64,
     level: u32,
 ) -> anyhow::Result<()> {
-    use zip::write::SimpleFileOptions;
     use zip::CompressionMethod;
+    use zip::write::SimpleFileOptions;
 
     let options = SimpleFileOptions::default()
         .compression_method(CompressionMethod::Deflated)

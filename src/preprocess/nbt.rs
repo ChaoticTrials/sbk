@@ -2,9 +2,9 @@ use std::fs::File;
 use std::io::{Read, Write};
 use std::path::Path;
 
+use flate2::Compression;
 use flate2::read::MultiGzDecoder;
 use flate2::write::GzEncoder;
-use flate2::Compression;
 
 pub fn preprocess_nbt(path: &Path) -> anyhow::Result<Vec<u8>> {
     preprocess_nbt_from_bytes(&std::fs::read(path)?)
@@ -37,8 +37,8 @@ pub fn reconstruct_nbt(raw: &[u8], out_path: &Path) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use flate2::write::GzEncoder;
     use flate2::Compression;
+    use flate2::write::GzEncoder;
     use std::io::Write as IoWrite;
     use tempfile::tempdir;
 

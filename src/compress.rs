@@ -7,12 +7,12 @@ use rayon::prelude::*;
 use walkdir::WalkDir;
 
 use crate::checksum::hash;
-use crate::classify::{classify, Group};
+use crate::classify::{Group, classify};
 use crate::codec::{self, Codec};
-use crate::filter::{accept, capture_now_ms, CompressOptions};
-use crate::format::frame_dir::{write_frame_dir, FrameDir, FrameEntry};
-use crate::format::header::{write_header, write_placeholder, Header, HEADER_DISK_SIZE};
-use crate::format::index::{write_index, IndexEntry};
+use crate::filter::{CompressOptions, accept, capture_now_ms};
+use crate::format::frame_dir::{FrameDir, FrameEntry, write_frame_dir};
+use crate::format::header::{HEADER_DISK_SIZE, Header, write_header, write_placeholder};
+use crate::format::index::{IndexEntry, write_index};
 use crate::preprocess::json::preprocess_json_from_bytes;
 use crate::preprocess::mca::preprocess_mca_from_bytes;
 use crate::preprocess::nbt::preprocess_nbt_from_bytes;

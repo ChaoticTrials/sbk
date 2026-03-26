@@ -1,9 +1,9 @@
 use std::io::{Read, Write};
 use std::path::Path;
 
+use flate2::Compression;
 use flate2::read::{MultiGzDecoder, ZlibDecoder};
 use flate2::write::ZlibEncoder;
-use flate2::Compression;
 use rayon::prelude::*;
 
 use crate::error::SbkError;
@@ -209,8 +209,8 @@ pub fn reconstruct_mca(mcap: &[u8], out_path: &Path) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use flate2::write::ZlibEncoder;
     use flate2::Compression;
+    use flate2::write::ZlibEncoder;
     use std::io::Write as IoWrite;
     use tempfile::tempdir;
 
