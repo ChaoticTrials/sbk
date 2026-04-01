@@ -24,11 +24,12 @@ pub fn extract(
     output_dir: &Path,
     threads: usize,
 ) -> anyhow::Result<u64> {
-    extract_impl(archive, patterns, output_dir, threads, |_, _, _| {}, true)
+    extract_impl(archive, patterns, output_dir, threads, |_, _, _| true, true)
 }
 
 /// Extraction with a progress callback for GUI use.
-/// `on_progress(completed, total, current_path)` is called after each file is written.
+/// `on_progress(phase, completed, total)` is called after each frame/file is processed.
+/// Returns `false` from the callback to cancel extraction.
 pub fn extract_with_progress<F>(
     archive: &Path,
     patterns: &[String],
@@ -37,7 +38,7 @@ pub fn extract_with_progress<F>(
     on_progress: F,
 ) -> anyhow::Result<u64>
 where
-    F: Fn(usize, usize, &str) + Send + Sync,
+    F: Fn(&str, usize, usize) -> bool + Send + Sync,
 {
     extract_impl(archive, patterns, output_dir, threads, on_progress, false)
 }
@@ -47,11 +48,11 @@ fn extract_impl<F>(
     patterns: &[String],
     output_dir: &Path,
     threads: usize,
-    on_file_written: F,
+    on_progress: F,
     show_bars: bool,
 ) -> anyhow::Result<u64>
 where
-    F: Fn(usize, usize, &str) + Send + Sync,
+    F: Fn(&str, usize, usize) -> bool + Send + Sync,
 {
     rayon::ThreadPoolBuilder::new()
         .num_threads(threads)
@@ -158,6 +159,8 @@ where
     let total_files = matched.len();
     let completed = Arc::new(AtomicUsize::new(0));
     let created_dirs: Mutex<HashSet<PathBuf>> = Mutex::new(HashSet::new());
+    let mut frames_read: usize = 0;
+    let decode_count = AtomicUsize::new(0);
 
     for chunk in unique_frames_sorted.chunks(batch_size) {
         // --- Phase A: read compressed bytes sequentially ---
@@ -191,6 +194,10 @@ where
             }
             batch_compressed.push(((group_id, frame_idx), buf));
             bar_decomp.inc(1);
+            frames_read += 1;
+            if !on_progress("decompress", frames_read, total_frames) {
+                return Err(anyhow::anyhow!("cancelled"));
+            }
         }
 
         // --- Phase B: decompress batch in parallel ---
@@ -210,6 +217,10 @@ where
                     anyhow::anyhow!("frame ({},{}) decompression failed: {}", key.0, key.1, e)
                 })?;
                 bar_decode.inc(1);
+                let n = decode_count.fetch_add(1, Ordering::Relaxed) + 1;
+                if !on_progress("decode", n, total_frames) {
+                    return Err(anyhow::anyhow!("cancelled"));
+                }
                 Ok((*key, raw))
             })
             .collect::<anyhow::Result<_>>()?;
@@ -270,7 +281,9 @@ where
                 filetime::set_file_mtime(&out_path, ft)?;
                 bar_write.inc(1);
                 let n = completed.fetch_add(1, Ordering::Relaxed) + 1;
-                on_file_written(n, total_files, &entry.path);
+                if !on_progress("write", n, total_files) {
+                    return Err(anyhow::anyhow!("cancelled"));
+                }
                 Ok(())
             })
             .collect();
