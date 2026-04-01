@@ -11,7 +11,7 @@ OUT_DIR="$(mktemp -d)"
 DEC_DIR="$(mktemp -d)"
 MD="$SCRIPT_DIR/BENCHMARK.md"
 SBK="$SCRIPT_DIR/target/release/sbk"
-THREADS=16
+THREADS=8
 
 cleanup() { rm -rf "$WORK_DIR" "$OUT_DIR" "$DEC_DIR"; }
 trap cleanup EXIT

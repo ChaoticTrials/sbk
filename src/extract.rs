@@ -62,6 +62,10 @@ where
     let mut f = File::open(archive)?;
     let header = read_header(&mut f)?;
     let codec = codec::from_algorithm(header.algorithm);
+    let decode_label = match header.algorithm {
+        crate::format::header::Algorithm::Lzma2 => "XZ Decode    ",
+        crate::format::header::Algorithm::Zstd => "ZSTD Decode  ",
+    };
 
     f.seek(SeekFrom::Start(header.frame_dir_offset))?;
     let frame_dir = read_frame_dir(&mut f)?;
@@ -104,19 +108,29 @@ where
         return Ok(0);
     }
 
-    // Collect unique frames needed
+    // Collect unique frames needed, with per-entry tracking and reference counts.
     let frame_size = header.frame_size_bytes;
-    let mut unique_frames: HashSet<(u8, u32)> = HashSet::new();
+    let mut frames_needed: Vec<HashSet<(u8, u32)>> = Vec::with_capacity(matched.len());
+    let mut frame_refcount: HashMap<(u8, u32), usize> = HashMap::new();
+
     for entry in &matched {
-        if entry.stream_raw_size == 0 {
-            continue;
+        let mut needed: HashSet<(u8, u32)> = HashSet::new();
+        if entry.stream_raw_size > 0 {
+            let start = (entry.stream_offset / frame_size) as u32;
+            let end = ((entry.stream_offset + entry.stream_raw_size - 1) / frame_size) as u32;
+            for fi in start..=end {
+                let key = (entry.group_id, fi);
+                needed.insert(key);
+                *frame_refcount.entry(key).or_insert(0) += 1;
+            }
         }
-        let start = (entry.stream_offset / frame_size) as u32;
-        let end = ((entry.stream_offset + entry.stream_raw_size - 1) / frame_size) as u32;
-        for fi in start..=end {
-            unique_frames.insert((entry.group_id, fi));
-        }
+        frames_needed.push(needed);
     }
+
+    let batch_size = threads.max(1);
+    let mut unique_frames_sorted: Vec<(u8, u32)> = frame_refcount.keys().copied().collect();
+    unique_frames_sorted.sort_unstable();
+    let total_frames = unique_frames_sorted.len();
 
     let mp = if show_bars {
         MultiProgress::new()
@@ -127,154 +141,164 @@ where
         .unwrap()
         .progress_chars("=> ");
 
-    let bar_decomp = mp.add(ProgressBar::new(unique_frames.len() as u64));
+    let bar_decomp = mp.add(ProgressBar::new(total_frames as u64));
     bar_decomp.set_style(bar_style.clone());
     bar_decomp.set_prefix("Decompressing");
 
-    // Stage 2: decompress unique frames in parallel
-    let unique_frames_vec: Vec<(u8, u32)> = unique_frames.into_iter().collect();
+    let bar_decode = mp.add(ProgressBar::new(total_frames as u64));
+    bar_decode.set_style(bar_style.clone());
+    bar_decode.set_prefix(decode_label);
 
-    // Read archive bytes for parallel processing (we need to seek independently)
-    // We'll read the needed compressed frame data first, then decompress in parallel
-    let mut frame_data_map: HashMap<(u8, u32), Vec<u8>> = HashMap::new();
-    for &(group_id, frame_idx) in &unique_frames_vec {
-        let group_frames = &frame_dir.groups[group_id as usize];
-        if frame_idx as usize >= group_frames.len() {
-            return Err(anyhow::anyhow!(
-                "frame index {} out of bounds for group {}",
-                frame_idx,
-                group_id
-            ));
-        }
-        let entry = &group_frames[frame_idx as usize];
-        // Sanity-check compressed size before allocating (guards against corrupt/malicious archives).
-        // 256 MiB is a generous upper bound; real compressed frames are typically far smaller.
-        const MAX_COMPRESSED_FRAME: u32 = 256 * 1024 * 1024;
-        if entry.frame_compressed_sz > MAX_COMPRESSED_FRAME {
-            return Err(anyhow::anyhow!(
-                "frame ({},{}) compressed size {} exceeds sanity limit",
-                group_id,
-                frame_idx,
-                entry.frame_compressed_sz
-            ));
-        }
-        let mut buf = vec![0u8; entry.frame_compressed_sz as usize];
-        f.seek(SeekFrom::Start(entry.frame_offset))?;
-        f.read_exact(&mut buf)?;
-
-        // Verify checksum
-        if hash(&buf) != entry.frame_checksum {
-            return Err(SbkError::FrameChecksumMismatch(frame_idx).into());
-        }
-
-        frame_data_map.insert((group_id, frame_idx), buf);
-    }
-
-    bar_decomp.inc(unique_frames_vec.len() as u64);
-    bar_decomp.finish();
-
-    // Decompress frames in parallel
-    let bar_decomp2 = mp.add(ProgressBar::new(frame_data_map.len() as u64));
-    bar_decomp2.set_style(bar_style.clone());
-    bar_decomp2.set_prefix("XZ Decode    ");
-
-    // Build a lookup from (group_id, frame_idx) -> expected raw size for decompression cap.
-    let frame_raw_sz_map: HashMap<(u8, u32), u32> = unique_frames_vec
-        .iter()
-        .map(|&(group_id, frame_idx)| {
-            let entry = &frame_dir.groups[group_id as usize][frame_idx as usize];
-            ((group_id, frame_idx), entry.frame_raw_sz)
-        })
-        .collect();
-
-    let decompressed_frames: HashMap<(u8, u32), Vec<u8>> = frame_data_map
-        .par_iter()
-        .map(|(&key, compressed)| {
-            let expected_raw_sz = frame_raw_sz_map[&key];
-            let raw = codec.decompress(compressed, expected_raw_sz).map_err(|e| {
-                anyhow::anyhow!("frame ({},{}) decompression failed: {}", key.0, key.1, e)
-            })?;
-            bar_decomp2.inc(1);
-            Ok((key, raw))
-        })
-        .collect::<anyhow::Result<_>>()?;
-
-    bar_decomp2.finish();
-
-    // Stage 3: reconstruct files in parallel
     let bar_write = mp.add(ProgressBar::new(matched.len() as u64));
-    bar_write.set_style(bar_style);
+    bar_write.set_style(bar_style.clone());
     bar_write.set_prefix("Writing      ");
 
-    let total = matched.len();
+    let mut decompressed_frames: HashMap<(u8, u32), Vec<u8>> = HashMap::new();
+    let mut entry_written: Vec<bool> = vec![false; matched.len()];
+    let total_files = matched.len();
     let completed = Arc::new(AtomicUsize::new(0));
     let created_dirs: Mutex<HashSet<PathBuf>> = Mutex::new(HashSet::new());
 
-    let written: Vec<anyhow::Result<()>> = matched
-        .par_iter()
-        .map(|entry| {
-            let preprocessed = slice_from_frames(
-                &decompressed_frames,
-                entry.group_id,
-                entry.stream_offset,
-                entry.stream_raw_size,
-                frame_size,
-            )?;
+    for chunk in unique_frames_sorted.chunks(batch_size) {
+        // --- Phase A: read compressed bytes sequentially ---
+        let mut batch_compressed: Vec<((u8, u32), Vec<u8>)> = Vec::with_capacity(chunk.len());
+        for &(group_id, frame_idx) in chunk {
+            let group_frames = &frame_dir.groups[group_id as usize];
+            if frame_idx as usize >= group_frames.len() {
+                return Err(anyhow::anyhow!(
+                    "frame index {} out of bounds for group {}",
+                    frame_idx,
+                    group_id
+                ));
+            }
+            let entry = &group_frames[frame_idx as usize];
+            // Sanity-check compressed size before allocating (guards against corrupt/malicious archives).
+            // 256 MiB is a generous upper bound; real compressed frames are typically far smaller.
+            const MAX_COMPRESSED_FRAME: u32 = 256 * 1024 * 1024;
+            if entry.frame_compressed_sz > MAX_COMPRESSED_FRAME {
+                return Err(anyhow::anyhow!(
+                    "frame ({},{}) compressed size {} exceeds sanity limit",
+                    group_id,
+                    frame_idx,
+                    entry.frame_compressed_sz
+                ));
+            }
+            let mut buf = vec![0u8; entry.frame_compressed_sz as usize];
+            f.seek(SeekFrom::Start(entry.frame_offset))?;
+            f.read_exact(&mut buf)?;
+            if hash(&buf) != entry.frame_checksum {
+                return Err(SbkError::FrameChecksumMismatch(frame_idx).into());
+            }
+            batch_compressed.push(((group_id, frame_idx), buf));
+            bar_decomp.inc(1);
+        }
 
-            let out_path = output_dir.join(&entry.path);
+        // --- Phase B: decompress batch in parallel ---
+        let batch_raw_sz: HashMap<(u8, u32), u32> = batch_compressed
+            .iter()
+            .map(|((gid, fi), _)| {
+                let sz = frame_dir.groups[*gid as usize][*fi as usize].frame_raw_sz;
+                ((*gid, *fi), sz)
+            })
+            .collect();
 
-            // Create parent directory (with deduplication)
-            if let Some(parent) = out_path.parent() {
-                let needs_create = {
-                    let dirs = created_dirs.lock().unwrap();
-                    !dirs.contains(parent)
-                };
-                if needs_create {
-                    std::fs::create_dir_all(parent)?;
-                    let mut dirs = created_dirs.lock().unwrap();
-                    dirs.insert(parent.to_path_buf());
+        let batch_decompressed: Vec<((u8, u32), Vec<u8>)> = batch_compressed
+            .par_iter()
+            .map(|(key, compressed)| {
+                let expected_raw_sz = batch_raw_sz[key];
+                let raw = codec.decompress(compressed, expected_raw_sz).map_err(|e| {
+                    anyhow::anyhow!("frame ({},{}) decompression failed: {}", key.0, key.1, e)
+                })?;
+                bar_decode.inc(1);
+                Ok((*key, raw))
+            })
+            .collect::<anyhow::Result<_>>()?;
+
+        for (key, raw) in batch_decompressed {
+            decompressed_frames.insert(key, raw);
+        }
+        // batch_compressed drops here, freeing compressed bytes for this batch.
+
+        // --- Phase C: write every entry whose frames are now fully available ---
+        let ready_indices: Vec<usize> = entry_written
+            .iter()
+            .enumerate()
+            .filter(|&(i, &written)| {
+                !written
+                    && frames_needed[i]
+                        .iter()
+                        .all(|key| decompressed_frames.contains_key(key))
+            })
+            .map(|(i, _)| i)
+            .collect();
+
+        let write_results: Vec<anyhow::Result<()>> = ready_indices
+            .par_iter()
+            .map(|&i| {
+                let entry = &matched[i];
+                let preprocessed = slice_from_frames(
+                    &decompressed_frames,
+                    entry.group_id,
+                    entry.stream_offset,
+                    entry.stream_raw_size,
+                    frame_size,
+                )?;
+                let out_path = output_dir.join(&entry.path);
+                if let Some(parent) = out_path.parent() {
+                    let needs_create = {
+                        let dirs = created_dirs.lock().unwrap();
+                        !dirs.contains(parent)
+                    };
+                    if needs_create {
+                        std::fs::create_dir_all(parent)?;
+                        let mut dirs = created_dirs.lock().unwrap();
+                        dirs.insert(parent.to_path_buf());
+                    }
+                }
+                let group = Group::from_u8(entry.group_id)
+                    .ok_or_else(|| anyhow::anyhow!("unknown group_id {}", entry.group_id))?;
+                match group {
+                    Group::Mca => reconstruct_mca(&preprocessed, &out_path)?,
+                    Group::Nbt => reconstruct_nbt(&preprocessed, &out_path)?,
+                    Group::Json => reconstruct_json(&preprocessed, &out_path)?,
+                    Group::Raw => std::fs::write(&out_path, &preprocessed)?,
+                }
+                let ft = filetime::FileTime::from_unix_time(
+                    entry.mtime_ms / 1000,
+                    ((entry.mtime_ms % 1000) * 1_000_000) as u32,
+                );
+                filetime::set_file_mtime(&out_path, ft)?;
+                bar_write.inc(1);
+                let n = completed.fetch_add(1, Ordering::Relaxed) + 1;
+                on_file_written(n, total_files, &entry.path);
+                Ok(())
+            })
+            .collect();
+
+        for r in write_results {
+            r?;
+        }
+
+        for &i in &ready_indices {
+            entry_written[i] = true;
+        }
+
+        // --- Phase D: evict frames no longer needed by any unwritten entry ---
+        for &i in &ready_indices {
+            for key in &frames_needed[i] {
+                if let Some(count) = frame_refcount.get_mut(key) {
+                    *count -= 1;
+                    if *count == 0 {
+                        decompressed_frames.remove(key);
+                    }
                 }
             }
-
-            // Reconstruct based on group
-            let group = Group::from_u8(entry.group_id)
-                .ok_or_else(|| anyhow::anyhow!("unknown group_id {}", entry.group_id))?;
-
-            match group {
-                Group::Mca => {
-                    reconstruct_mca(&preprocessed, &out_path)?;
-                }
-                Group::Nbt => {
-                    reconstruct_nbt(&preprocessed, &out_path)?;
-                }
-                Group::Json => {
-                    reconstruct_json(&preprocessed, &out_path)?;
-                }
-                Group::Raw => {
-                    std::fs::write(&out_path, &preprocessed)?;
-                }
-            }
-
-            // Restore mtime
-            let ft = filetime::FileTime::from_unix_time(
-                entry.mtime_ms / 1000,
-                ((entry.mtime_ms % 1000) * 1_000_000) as u32,
-            );
-            filetime::set_file_mtime(&out_path, ft)?;
-
-            bar_write.inc(1);
-            let n = completed.fetch_add(1, Ordering::Relaxed) + 1;
-            on_file_written(n, total, &entry.path);
-            Ok(())
-        })
-        .collect();
-
-    bar_write.finish();
-
-    // Propagate first error
-    for r in written {
-        r?;
+        }
     }
+
+    bar_decomp.finish();
+    bar_decode.finish();
+    bar_write.finish();
 
     Ok(matched.len() as u64)
 }
