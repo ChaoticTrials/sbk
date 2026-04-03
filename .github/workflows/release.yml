@@ -15,6 +15,10 @@ jobs:
         with:
           targets: x86_64-unknown-linux-musl,aarch64-unknown-linux-musl
 
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-targets: "true"
+
       - name: Install build tools
         run: |
           sudo apt-get update
@@ -26,12 +30,12 @@ jobs:
       - name: Build x86_64 .deb
         run: |
           cargo build --release --target x86_64-unknown-linux-musl
-          cargo deb --target x86_64-unknown-linux-musl --no-build
+          cargo deb --target x86_64-unknown-linux-musl --no-build --no-strip
 
       - name: Build aarch64 .deb
         run: |
           cross build --release --target aarch64-unknown-linux-musl
-          cargo deb --target aarch64-unknown-linux-musl --no-build
+          cargo deb --target aarch64-unknown-linux-musl --no-build --no-strip
 
       - name: Stage .deb files
         run: |
@@ -51,6 +55,8 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
+      - uses: Swatinem/rust-cache@v2
+
       - name: Build
         run: cargo build --release
 
@@ -67,6 +73,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-apple-darwin,aarch64-apple-darwin
+
+      - uses: Swatinem/rust-cache@v2
 
       - name: Build x86_64
         run: cargo build --release --target x86_64-apple-darwin
@@ -94,6 +102,8 @@ jobs:
       - uses: actions/checkout@v4
 
       - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
 
       - name: Publish to crates.io
         run: cargo publish --token ${{ secrets.CRATES_IO_TOKEN }}
