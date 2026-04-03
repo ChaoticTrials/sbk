@@ -4,7 +4,7 @@ use clap::{Parser, Subcommand};
 
 fn default_threads() -> usize {
     std::thread::available_parallelism()
-        .map(|n| n.get())
+        .map(|n| n.get() / 2)
         .unwrap_or(4)
 }
 
