@@ -27,7 +27,7 @@ pub fn info(archive: &Path, list: bool) -> anyhow::Result<()> {
 
     println!("SBK Archive: {}", archive.display());
     println!("  Format version: {}", header.format_version);
-    println!("  Algorithm:        {}", header.algorithm);
+    println!("  Algorithm:      {}", header.algorithm);
     println!("  Files stored:   {}", header.file_count);
     println!(
         "  Frame size:     {} MiB",
@@ -41,10 +41,10 @@ pub fn info(archive: &Path, list: bool) -> anyhow::Result<()> {
             counts[g as u8 as usize] += 1;
         }
     }
-    println!("  MCA files:  {}", counts[0]);
-    println!("  NBT files:  {}", counts[1]);
-    println!("  JSON files: {}", counts[2]);
-    println!("  RAW files:  {}", counts[3]);
+    println!("  MCA files:      {}", counts[0]);
+    println!("  NBT files:      {}", counts[1]);
+    println!("  JSON files:     {}", counts[2]);
+    println!("  RAW files:      {}", counts[3]);
 
     // Frame directory summary
     println!("Frame directory:");
