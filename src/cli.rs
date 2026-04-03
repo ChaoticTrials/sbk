@@ -27,8 +27,8 @@ pub enum Commands {
         /// Number of threads (default: logical CPU count)
         #[arg(short, long, default_value_t = default_threads())]
         threads: usize,
-        /// LZMA preset level 1–9 (default: 9)
-        #[arg(short, long, default_value_t = 9,
+        /// LZMA preset level 1–9 (default: 3)
+        #[arg(short, long, default_value_t = 3,
               value_parser = clap::value_parser!(u32).range(1..=9))]
         level: u32,
         /// Skip files not modified within the last N milliseconds (N >= 1)
