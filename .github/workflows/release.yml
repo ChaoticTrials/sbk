@@ -106,7 +106,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Publish to crates.io
-        run: cargo publish --token ${{ secrets.CRATES_IO_TOKEN }}
+        run: cargo publish --token ${{ secrets.CRATES_IO_TOKEN }} || echo "Already published, skipping."
 
   publish:
     needs: [build-linux, build-windows, build-macos]
@@ -149,11 +149,26 @@ jobs:
 
       - name: Import GPG key
         run: |
+          mkdir -p ~/.gnupg
+          chmod 700 ~/.gnupg
+          echo "pinentry-mode loopback" >> ~/.gnupg/gpg.conf
+          echo "allow-loopback-pinentry" >> ~/.gnupg/gpg-agent.conf
+          gpgconf --kill gpg-agent
           echo "${{ secrets.GPG_PRIVATE_KEY }}" | gpg --batch --import
 
       - name: Build apt repo with aptly
         run: |
-          mkdir -p ~/.aptly
+          mkdir -p apt-repo/public
+          cat > ~/.aptly.conf <<EOF
+          {
+            "FileSystemPublishEndpoints": {
+              "apt-repo": {
+                "rootDir": "$GITHUB_WORKSPACE/apt-repo/public",
+                "linkMethod": "copy"
+              }
+            }
+          }
+          EOF
           aptly repo create -distribution=stable -component=main sbk 2>/dev/null || true
           aptly repo add sbk artifacts/deb-packages/*.deb
           aptly snapshot create sbk-${{ github.ref_name }} from repo sbk
@@ -162,7 +177,7 @@ jobs:
             -passphrase="${{ secrets.GPG_PASSPHRASE }}" \
             -architectures=amd64,arm64 \
             sbk-${{ github.ref_name }} \
-            filesystem:apt-repo/public:sbk
+            filesystem:apt-repo:sbk
 
       - name: Commit and push updated apt-repo
         working-directory: apt-repo
