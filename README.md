@@ -30,6 +30,19 @@ See [BENCHMARK.md](BENCHMARK.md) for full results, including compression and dec
 ## Installation
 
 ```bash
+curl -fsSL https://repo.chaotictrials.de/apt-keyring.gpg \
+  | sudo tee /usr/share/keyrings/chaotictrials.gpg > /dev/null
+echo "deb [signed-by=/usr/share/keyrings/chaotictrials.gpg] https://repo.chaotictrials.de/ stable main" \
+  | sudo tee /etc/apt/sources.list.d/chaotictrials.list
+sudo apt update
+sudo apt install sbk
+```
+
+Alternatively, download the `.deb` directly from the [Releases](https://github.com/ChaoticTrials/sbk/releases) page.
+
+Or install via `cargo`:
+
+```bash
 cargo install sbk
 ```
 

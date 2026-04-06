@@ -161,6 +161,7 @@ jobs:
           mkdir -p apt-repo/public
           cat > ~/.aptly.conf <<EOF
           {
+            "rootDir": "$GITHUB_WORKSPACE/apt-repo/.aptly",
             "FileSystemPublishEndpoints": {
               "apt-repo": {
                 "rootDir": "$GITHUB_WORKSPACE/apt-repo/public",
@@ -169,15 +170,20 @@ jobs:
             }
           }
           EOF
-          aptly repo create -distribution=stable -component=main sbk 2>/dev/null || true
-          aptly repo add sbk artifacts/deb-packages/*.deb
-          aptly snapshot create sbk-${{ github.ref_name }} from repo sbk
-          aptly publish snapshot \
+          aptly repo create -distribution=stable -component=main packages 2>/dev/null || true
+          aptly repo add packages artifacts/deb-packages/*.deb
+          aptly publish repo \
             -gpg-key=${{ secrets.GPG_KEY_ID }} \
             -passphrase="${{ secrets.GPG_PASSPHRASE }}" \
             -architectures=amd64,arm64 \
-            sbk-${{ github.ref_name }} \
-            filesystem:apt-repo:sbk
+            -distribution=stable \
+            packages \
+            filesystem:apt-repo: 2>/dev/null || \
+          aptly publish update \
+            -gpg-key=${{ secrets.GPG_KEY_ID }} \
+            -passphrase="${{ secrets.GPG_PASSPHRASE }}" \
+            stable \
+            filesystem:apt-repo:
 
       - name: Commit and push updated apt-repo
         working-directory: apt-repo
