@@ -61,20 +61,35 @@ cargo build --release
 sbk compress <world_dir> [OPTIONS]
 ```
 
-| Option                   | Default           | Description                                     |
-|--------------------------|-------------------|-------------------------------------------------|
-| `-o, --output <FILE>`    | `<world_dir>.sbk` | Output archive path                             |
-| `-t, --threads <N>`      | logical CPU count | Worker threads                                  |
-| `-l, --level <1–9>`      | `9`               | Compression level                               |
-| `-a, --algorithm <ALG>`  | `lzma2`           | Compression algorithm: `lzma2` or `zstd`        |
-| `--max-age <MS>`         | —                 | Skip files not modified in the last N ms        |
-| `--since <TIMESTAMP>`    | —                 | Skip files with mtime below Unix timestamp (ms) |
-| `--exclude <PATTERN>…`   | —                 | Exclude files matching glob patterns            |
-| `--include <PATTERN>…`   | —                 | Include ONLY files matching glob patterns       |
-| `--include-session-lock` | off               | Include `session.lock` (excluded by default)    |
+| Option                   | Default           | Description                                             |
+|--------------------------|-------------------|---------------------------------------------------------|
+| `-o, --output <FILE>`    | `<world_dir>.sbk` | Output archive path                                     |
+| `-t, --threads <N>`      | logical CPU count | Worker threads                                          |
+| `-l, --level <1–9>`      | `9`               | Compression level                                       |
+| `-a, --algorithm <ALG>`  | `lzma2`           | Compression algorithm: `lzma2` or `zstd`                |
+| `--max-age <MS>`         | —                 | Skip files not modified in the last N ms                |
+| `--since <TIMESTAMP>`    | —                 | Skip files with mtime below Unix timestamp (ms)         |
+| `--exclude <PATTERN>…`   | —                 | Exclude files matching glob patterns (repeatable)       |
+| `--include <PATTERN>…`   | —                 | Include ONLY files matching glob patterns (repeatable)  |
+| `--include-session-lock` | off               | Include `session.lock` (excluded by default)            |
 | `-q, --quiet`            | off               | Suppress progress bars, summary, and non-fatal warnings |
 
 `--exclude` and `--include` are mutually exclusive.
+
+#### Multi-pattern usage
+
+Both flags accept one or more patterns in a single invocation. Three safe forms:
+
+```bash
+# 1. world_dir before the flag (most common)
+sbk compress world_dir --exclude "*.zip" "*.dat_old"
+
+# 2. Repeat the flag once per pattern
+sbk compress world_dir --exclude "*.zip" --exclude "*.dat_old"
+
+# 3. Use -- to separate world_dir from patterns when world_dir comes last
+sbk compress --exclude "*.zip" "*.dat_old" -- world_dir
+```
 
 ### Decompress
 

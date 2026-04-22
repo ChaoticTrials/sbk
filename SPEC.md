@@ -161,6 +161,19 @@ Exclude all files by default; include only files whose relative path matches at 
 error: --exclude and --include are mutually exclusive; use one or the other
 ```
 
+**Safe multi-pattern invocation forms:** both flags use `num_args = 1..`, meaning they greedily consume subsequent arguments. This can cause the positional `world_dir` argument to be misinterpreted if placed after the flag. Three safe invocation patterns are supported:
+
+```bash
+# 1. Positional world_dir before the flag (safest — clap stops consuming at a known positional)
+sbk compress world_dir --exclude "*.zip" "*.dat_old"
+
+# 2. Repeat the flag once per pattern (always unambiguous)
+sbk compress world_dir --exclude "*.zip" --exclude "*.dat_old"
+
+# 3. Use -- to terminate option parsing, placing world_dir after it
+sbk compress --exclude "*.zip" "*.dat_old" -- world_dir
+```
+
 ### 4.4 `CompressOptions` Struct
 
 ```rust

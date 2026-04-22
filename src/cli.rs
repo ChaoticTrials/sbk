@@ -37,10 +37,18 @@ pub enum Commands {
         /// Skip files with mtime below this millisecond Unix timestamp
         #[arg(long, value_name = "TIMESTAMP")]
         since: Option<i64>,
-        /// Exclude files matching these glob patterns (mutually exclusive with --include)
+        /// Exclude files matching a glob pattern.
+        /// May be repeated for multiple patterns: --exclude "*.zip" --exclude "*.dat_old"
+        /// When using list form, place world_dir first or terminate with --:
+        ///   sbk compress world_dir --exclude "*.zip" "*.dat_old"
+        ///   sbk compress --exclude "*.zip" "*.dat_old" -- world_dir
         #[arg(long, value_name = "PATTERN", num_args = 1..)]
         exclude: Vec<String>,
-        /// Include ONLY files matching these glob patterns (mutually exclusive with --exclude)
+        /// Include ONLY files matching a glob pattern (mutually exclusive with --exclude).
+        /// May be repeated for multiple patterns: --include "region/**" --include "*.json"
+        /// When using list form, place world_dir first or terminate with --:
+        ///   sbk compress world_dir --include "region/**" "*.json"
+        ///   sbk compress --include "region/**" "*.json" -- world_dir
         #[arg(long, value_name = "PATTERN", num_args = 1..)]
         include: Vec<String>,
         /// Include session.lock in the archive (excluded by default)
