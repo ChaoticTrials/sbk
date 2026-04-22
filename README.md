@@ -98,20 +98,43 @@ sbk info <file.sbk> [--list]
 
 `--list` prints the full file manifest as a tree, with file type and size for each entry.
 
-### Convert to a standard archive format
+### Convert between SBK and standard archive formats
+
+`sbk convert` works in both directions:
+
+**SBK → zip / tar.gz / tar.xz**
 
 ```bash
-sbk convert <file.sbk> --to <format> [-o <file>] [-t <threads>] [-l <level>]
+sbk convert <file.sbk> --to <format> [-o <output>] [-t <threads>] [-l <level>]
 ```
 
-| Option                | Default                | Description                              |
-|-----------------------|------------------------|------------------------------------------|
-| `--to <format>`       | —                      | Target format: `zip`, `tar.gz`, `tar.xz` |
-| `-o, --output <FILE>` | `<archive_stem>.<ext>` | Output file path                         |
-| `-t, --threads <N>`   | logical CPU count      | Worker threads for SBK decompression     |
-| `-l, --level <1–9>`   | `6`                    | Compression level for the target format  |
+```bash
+sbk convert world.sbk --to zip
+sbk convert world.sbk --to tar.gz -o backup.tar.gz
+sbk convert world.sbk --to tar.xz -l 9
+```
 
-Files are reconstructed in memory and streamed directly into the output archive — no temporary directory is needed.
+**zip / tar.gz / tar.xz → SBK**
+
+```bash
+sbk convert <archive> [-o <output.sbk>] [-t <threads>] [-l <level>] [-a <algo>]
+```
+
+```bash
+sbk convert world.zip
+sbk convert world.tar.gz -o world.sbk
+sbk convert world.tar.xz --algorithm zstd
+```
+
+| Option                    | Default                           | Description                                      |
+|---------------------------|-----------------------------------|--------------------------------------------------|
+| `--to <format>`           | auto (sbk when input is not .sbk) | Target format: `zip`, `tar.gz`, `tar.xz`, `sbk`  |
+| `-o, --output <FILE>`     | `<archive_stem>.<ext>`            | Output file path                                 |
+| `-t, --threads <N>`       | logical CPU count                 | Worker threads                                   |
+| `-l, --level <1–9>`       | `6`                               | Compression level for the output format          |
+| `-a, --algorithm <ALGO>`  | `lzma2`                           | Algorithm for output SBK: `lzma2` or `zstd`      |
+
+When converting SBK → other formats, files are reconstructed in memory and streamed into the output archive with no temporary directory. When converting other formats → SBK, the input archive is extracted to a temporary directory and then compressed with the same pipeline as `sbk compress`.
 
 ### Verify integrity
 

@@ -36,6 +36,7 @@ thiserror = "2"
 zip = "8.5.0"
 tar = "0.4"
 time = "0.3"
+tempfile = "3"
 
 [profile.release]
 strip = true

@@ -5,7 +5,6 @@ use std::time::Instant;
 use clap::Parser;
 
 use sbk::cli::{Cli, Commands};
-use sbk::convert::ConvertFormat;
 use sbk::error::SbkError;
 use sbk::filter::{CompressOptions, FilterMode};
 use sbk::format::header::Algorithm;
@@ -181,28 +180,105 @@ fn run() -> anyhow::Result<()> {
             output,
             threads,
             level,
+            algorithm: algorithm_str,
         } => {
-            let format = ConvertFormat::from_str(&to).ok_or_else(|| {
-                anyhow::anyhow!("unknown format '{}': expected zip, tar.gz, or tar.xz", to)
+            let detected = sbk::convert::detect_format(&archive).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "cannot detect format of '{}'; expected .sbk, .zip, .tar.gz, or .tar.xz",
+                    archive.display()
+                )
             })?;
 
-            let output = output.unwrap_or_else(|| {
-                let stem = archive
-                    .file_stem()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .to_string();
-                PathBuf::from(format!("{}{}", stem, format.extension()))
-            });
-
-            let t = Instant::now();
-            let n = sbk::convert::convert(&archive, &output, format, threads, level)?;
-            println!(
-                "Converted {} file(s) → {} in {:.2}s.",
-                n,
-                output.display(),
-                t.elapsed().as_secs_f64()
-            );
+            match detected {
+                // SBK → other format
+                sbk::convert::ConvertFormat::Sbk => {
+                    let to_str = to.ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "--to is required when converting from SBK; valid values: zip, tar.gz, tar.xz"
+                        )
+                    })?;
+                    let format = sbk::convert::ConvertFormat::from_str(&to_str)
+                        .filter(|f| *f != sbk::convert::ConvertFormat::Sbk)
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "unknown --to format '{}': expected zip, tar.gz, tar.xz",
+                                to_str
+                            )
+                        })?;
+                    let output = output.unwrap_or_else(|| {
+                        let stem = archive
+                            .file_stem()
+                            .unwrap_or_default()
+                            .to_string_lossy()
+                            .to_string();
+                        PathBuf::from(format!("{}{}", stem, format.extension()))
+                    });
+                    let t = Instant::now();
+                    let n =
+                        sbk::convert::convert_from_sbk(&archive, &output, format, threads, level)?;
+                    println!(
+                        "Converted {} file(s) → {} in {:.2}s.",
+                        n,
+                        output.display(),
+                        t.elapsed().as_secs_f64()
+                    );
+                }
+                // zip/tar.gz/tar.xz → SBK
+                from_format => {
+                    if let Some(ref to_str) = to {
+                        if to_str.to_lowercase() != "sbk" {
+                            return Err(anyhow::anyhow!(
+                                "cannot convert {:?} to '{}': only --to sbk is valid for non-SBK inputs",
+                                from_format,
+                                to_str
+                            ));
+                        }
+                    }
+                    let algorithm = match algorithm_str.to_lowercase().as_str() {
+                        "lzma2" => Algorithm::Lzma2,
+                        "zstd" => Algorithm::Zstd,
+                        other => {
+                            return Err(anyhow::anyhow!(
+                                "unknown algorithm '{}': expected lzma2, zstd",
+                                other
+                            ));
+                        }
+                    };
+                    let stem = {
+                        let name = archive.file_name().unwrap_or_default().to_string_lossy();
+                        let ext = match from_format {
+                            sbk::convert::ConvertFormat::TarGz => ".tar.gz",
+                            sbk::convert::ConvertFormat::TarXz => ".tar.xz",
+                            _ => "",
+                        };
+                        if ext.is_empty() {
+                            archive
+                                .file_stem()
+                                .unwrap_or_default()
+                                .to_string_lossy()
+                                .to_string()
+                        } else {
+                            name.trim_end_matches(ext).to_string()
+                        }
+                    };
+                    let output = output.unwrap_or_else(|| PathBuf::from(format!("{}.sbk", stem)));
+                    let t = Instant::now();
+                    let n = sbk::convert::convert_to_sbk(
+                        &archive,
+                        &output,
+                        from_format,
+                        threads,
+                        level,
+                        algorithm,
+                    )?;
+                    println!(
+                        "Converted {} file(s) → {} in {:.2}s.",
+                        n,
+                        output.display(),
+                        t.elapsed().as_secs_f64()
+                    );
+                }
+            }
         }
     }
 

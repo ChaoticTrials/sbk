@@ -567,6 +567,7 @@ USAGE:
   sbk extract    <file.sbk>   <pattern>...  [OPTIONS]
   sbk info       <file.sbk>   [--list]
   sbk verify     <file.sbk>
+  sbk convert    <archive>    [OPTIONS]
 
 COMPRESS OPTIONS:
   -o, --output  <file.sbk>           Default: <world_dir_name>.sbk in current dir
@@ -595,11 +596,23 @@ EXTRACT OPTIONS:
 INFO OPTIONS:
   --list                             Print full file manifest table
 
+CONVERT OPTIONS:
+  <archive>                          Input: .sbk, .zip, .tar.gz, or .tar.xz — format auto-detected
+  --to <format>                      Target: zip, tar.gz, tar.xz (required when input is SBK)
+                                     Omit when input is zip/tar to convert to SBK automatically
+  -o, --output  <file>               Default: <archive_stem>.<ext> in current dir
+  -t, --threads <n>                  Default: logical CPU count
+  -l, --level   <1-9>                Compression level for the output format; default 6
+  -a, --algorithm <lzma2|zstd>       Algorithm for output SBK only; default lzma2
+
 NOTES:
   sbk decompress is equivalent to: sbk extract <file.sbk> "**"
   sbk verify exits with code 0 on success, 1 on any checksum failure.
   Files excluded during compression are absent from the archive and cannot be extracted.
   session.lock is excluded by default; use --include-session-lock to override.
+  sbk convert detects the input format from the file extension (.sbk, .zip, .tar.gz, .tar.xz).
+    SBK → other: reconstructs files in memory and streams into the output archive.
+    other → SBK: extracts to a temp dir, then compresses with the same pipeline as sbk compress.
 ```
 
 ### 9.1 Startup Validation (compress)

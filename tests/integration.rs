@@ -1263,7 +1263,8 @@ fn test_convert_zip() {
     let zip_path = tmp.path().join("world.zip");
 
     let n =
-        sbk::convert::convert(&archive, &zip_path, sbk::convert::ConvertFormat::Zip, 2, 6).unwrap();
+        sbk::convert::convert_from_sbk(&archive, &zip_path, sbk::convert::ConvertFormat::Zip, 2, 6)
+            .unwrap();
     assert!(n > 0, "expected at least one file in converted ZIP");
     assert!(zip_path.exists());
 
@@ -1316,7 +1317,7 @@ fn test_convert_tar_gz() {
     let (_world_dir, archive) = compress_test_world(&tmp);
     let tar_gz_path = tmp.path().join("world.tar.gz");
 
-    let n = sbk::convert::convert(
+    let n = sbk::convert::convert_from_sbk(
         &archive,
         &tar_gz_path,
         sbk::convert::ConvertFormat::TarGz,
@@ -1359,7 +1360,7 @@ fn test_convert_tar_xz() {
     let (_world_dir, archive) = compress_test_world(&tmp);
     let tar_xz_path = tmp.path().join("world.tar.xz");
 
-    let n = sbk::convert::convert(
+    let n = sbk::convert::convert_from_sbk(
         &archive,
         &tar_xz_path,
         sbk::convert::ConvertFormat::TarXz,
@@ -1432,7 +1433,8 @@ fn test_convert_zip_round_trip_mca() {
     let (_world_dir, archive) = compress_test_world(&tmp);
     let zip_path = tmp.path().join("world_rt.zip");
 
-    sbk::convert::convert(&archive, &zip_path, sbk::convert::ConvertFormat::Zip, 2, 1).unwrap();
+    sbk::convert::convert_from_sbk(&archive, &zip_path, sbk::convert::ConvertFormat::Zip, 2, 1)
+        .unwrap();
 
     let zip_file = fs::File::open(&zip_path).unwrap();
     let mut za = zip::ZipArchive::new(zip_file).unwrap();
@@ -1449,4 +1451,51 @@ fn test_convert_zip_round_trip_mca() {
     let mcap = sbk::preprocess::mca::preprocess_mca_from_bytes(&mca_data).unwrap();
     let chunk_count = u16::from_le_bytes([mcap[4], mcap[5]]);
     assert_eq!(chunk_count, 5, "reconstructed MCA must have 5 chunks");
+}
+
+// ─── Test: zip → sbk conversion ──────────────────────────────────────────────
+
+#[test]
+fn test_convert_zip_to_sbk() {
+    use std::io::Write as _;
+
+    let tmp = TempDir::new().unwrap();
+
+    // Build a small zip with a handful of files
+    let zip_path = tmp.path().join("test_world.zip");
+    {
+        let zip_file = fs::File::create(&zip_path).unwrap();
+        let mut zip_writer = zip::ZipWriter::new(zip_file);
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+        zip_writer.start_file("icon.png", options).unwrap();
+        zip_writer.write_all(b"\x89PNG\r\n\x1a\nfakeicon").unwrap();
+        zip_writer.start_file("level.dat", options).unwrap();
+        zip_writer.write_all(b"fake_nbt_data").unwrap();
+        zip_writer.start_file("data/raids.dat", options).unwrap();
+        zip_writer.write_all(b"raid_nbt").unwrap();
+        zip_writer.finish().unwrap();
+    }
+
+    // Convert the zip to an sbk archive via the binary
+    let sbk_path = tmp.path().join("test_world.sbk");
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_sbk"))
+        .args([
+            "convert",
+            zip_path.to_str().unwrap(),
+            "-o",
+            sbk_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "sbk convert zip→sbk failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(sbk_path.exists(), ".sbk output file must exist");
+
+    // Verify the produced sbk archive passes integrity checks
+    let ok = sbk::verify::verify(&sbk_path, 2).unwrap();
+    assert!(ok, "converted sbk archive must pass verify");
 }

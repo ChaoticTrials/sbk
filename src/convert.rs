@@ -18,6 +18,7 @@ use crate::solid::extractor::slice_from_frames;
 /// The target archive format for `sbk convert`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConvertFormat {
+    Sbk,
     Zip,
     TarGz,
     TarXz,
@@ -26,6 +27,7 @@ pub enum ConvertFormat {
 impl ConvertFormat {
     pub fn from_str(s: &str) -> Option<Self> {
         match s.to_lowercase().as_str() {
+            "sbk" => Some(Self::Sbk),
             "zip" => Some(Self::Zip),
             "tar.gz" => Some(Self::TarGz),
             "tar.xz" => Some(Self::TarXz),
@@ -35,11 +37,101 @@ impl ConvertFormat {
 
     pub fn extension(self) -> &'static str {
         match self {
+            Self::Sbk => ".sbk",
             Self::Zip => ".zip",
             Self::TarGz => ".tar.gz",
             Self::TarXz => ".tar.xz",
         }
     }
+}
+
+/// Detect the archive format from a file path's extension.
+/// Returns `None` if the format is unrecognised.
+pub fn detect_format(path: &Path) -> Option<ConvertFormat> {
+    let name = path.file_name()?.to_str()?;
+    if name.ends_with(".sbk") {
+        Some(ConvertFormat::Sbk)
+    } else if name.ends_with(".tar.gz") {
+        Some(ConvertFormat::TarGz)
+    } else if name.ends_with(".tar.xz") {
+        Some(ConvertFormat::TarXz)
+    } else if name.ends_with(".zip") {
+        Some(ConvertFormat::Zip)
+    } else {
+        None
+    }
+}
+
+/// Convert a zip/tar.gz/tar.xz archive to an SBK archive.
+///
+/// The input archive is extracted into a temporary directory, then compressed
+/// with `sbk compress`. Returns the number of files written (always 0 — cosmetic).
+pub fn convert_to_sbk(
+    archive: &Path,
+    output: &Path,
+    from_format: ConvertFormat,
+    threads: usize,
+    level: u32,
+    algorithm: crate::format::header::Algorithm,
+) -> anyhow::Result<u64> {
+    let temp_dir = tempfile::TempDir::new()
+        .with_context(|| "failed to create temporary directory for extraction")?;
+
+    match from_format {
+        ConvertFormat::Zip => {
+            let file = File::open(archive)
+                .with_context(|| format!("failed to open '{}'", archive.display()))?;
+            let mut zip_archive = zip::ZipArchive::new(file)
+                .with_context(|| format!("failed to read ZIP '{}'", archive.display()))?;
+            for i in 0..zip_archive.len() {
+                let mut entry = zip_archive.by_index(i)?;
+                if entry.is_dir() {
+                    continue;
+                }
+                let out_path = temp_dir.path().join(entry.name());
+                if let Some(parent) = out_path.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                let mut out_file = File::create(&out_path)
+                    .with_context(|| format!("failed to create '{}'", out_path.display()))?;
+                std::io::copy(&mut entry, &mut out_file)?;
+            }
+        }
+        ConvertFormat::TarGz => {
+            let file = File::open(archive)
+                .with_context(|| format!("failed to open '{}'", archive.display()))?;
+            let decoder = flate2::read::GzDecoder::new(file);
+            let mut tar = tar::Archive::new(decoder);
+            tar.unpack(temp_dir.path())
+                .with_context(|| format!("failed to unpack tar.gz '{}'", archive.display()))?;
+        }
+        ConvertFormat::TarXz => {
+            let file = File::open(archive)
+                .with_context(|| format!("failed to open '{}'", archive.display()))?;
+            let decoder = xz2::read::XzDecoder::new(file);
+            let mut tar = tar::Archive::new(decoder);
+            tar.unpack(temp_dir.path())
+                .with_context(|| format!("failed to unpack tar.xz '{}'", archive.display()))?;
+        }
+        ConvertFormat::Sbk => {
+            return Err(anyhow::anyhow!("cannot convert SBK to SBK"));
+        }
+    }
+
+    let opts = crate::filter::CompressOptions {
+        output: output.to_path_buf(),
+        threads,
+        level,
+        algorithm,
+        max_age: None,
+        since: None,
+        patterns: crate::filter::FilterMode::None,
+        include_session_lock: false,
+        quiet: false,
+    };
+    crate::compress::compress(temp_dir.path(), &opts)?;
+
+    Ok(0)
 }
 
 /// Reconstruct the original file bytes from the preprocessed stream bytes.
@@ -55,7 +147,7 @@ pub fn reconstruct_bytes(group_id: u8, preprocessed: &[u8]) -> anyhow::Result<Ve
 /// Convert an SBK archive to a standard archive format.
 ///
 /// Returns the number of files written into the output archive.
-pub fn convert(
+pub fn convert_from_sbk(
     archive: &Path,
     output: &Path,
     format: ConvertFormat,
@@ -121,6 +213,11 @@ pub fn convert(
                 let encoder = xz2::write::XzEncoder::new(out, level);
                 let mut tar = tar::Builder::new(encoder);
                 tar.finish()?;
+            }
+            ConvertFormat::Sbk => {
+                return Err(anyhow::anyhow!(
+                    "cannot convert SBK to SBK: use a different --to format"
+                ));
             }
         }
         return Ok(0);
@@ -211,6 +308,11 @@ pub fn convert(
         ConvertFormat::TarXz => {
             let encoder = xz2::write::XzEncoder::new(out, level);
             write_tar(encoder, &all_entries, &decompressed_frames, frame_size)?;
+        }
+        ConvertFormat::Sbk => {
+            return Err(anyhow::anyhow!(
+                "cannot convert SBK to SBK: use a different --to format"
+            ));
         }
     }
 
