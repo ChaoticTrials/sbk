@@ -72,7 +72,7 @@ sbk compress <world_dir> [OPTIONS]
 | `--exclude <PATTERN>…`   | —                 | Exclude files matching glob patterns            |
 | `--include <PATTERN>…`   | —                 | Include ONLY files matching glob patterns       |
 | `--include-session-lock` | off               | Include `session.lock` (excluded by default)    |
-| `-q, --quiet`            | off               | Suppress progress bars and summary              |
+| `-q, --quiet`            | off               | Suppress progress bars, summary, and non-fatal warnings |
 
 `--exclude` and `--include` are mutually exclusive.
 

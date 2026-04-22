@@ -579,7 +579,7 @@ COMPRESS OPTIONS:
       --include  <pattern>...        Include ONLY files matching any of these glob patterns
                                      (--exclude and --include are mutually exclusive)
       --include-session-lock         Include session.lock (excluded by default)
-  -q, --quiet                        Suppress progress bars and summary output
+  -q, --quiet                        Suppress progress bars, summary output, and non-fatal warnings
 
 DECOMPRESS OPTIONS:
   -o, --output  <dir>                Default: <world_name>/ in current dir

@@ -88,7 +88,9 @@ where
         let meta = match entry.metadata() {
             Ok(m) => m,
             Err(e) => {
-                eprintln!("Warning: metadata failed for {}: {}", rel, e);
+                if !opts.quiet {
+                    eprintln!("Warning: metadata failed for {}: {}", rel, e);
+                }
                 skipped += 1;
                 continue;
             }
@@ -163,6 +165,7 @@ where
 
         // Process files in chunks of batch_size: preprocess each chunk in parallel,
         // then drain results in sorted order into the frame buffer.
+        let quiet = opts.quiet;
         for chunk in files.chunks(batch_size) {
             // Parallel preprocessing: read + hash + preprocess each file concurrently.
             let results: Vec<Option<(u64, u32, Vec<u8>)>> = chunk
@@ -171,7 +174,9 @@ where
                     let file_bytes = match std::fs::read(&fi.abs_path) {
                         Ok(b) => b,
                         Err(e) => {
-                            eprintln!("Warning: could not read {}: {}", fi.rel_path, e);
+                            if !quiet {
+                                eprintln!("Warning: could not read {}: {}", fi.rel_path, e);
+                            }
                             return None;
                         }
                     };
@@ -179,19 +184,31 @@ where
                     let file_checksum = hash(&file_bytes);
                     let preprocessed = match group_enum {
                         Group::Mca => preprocess_mca_from_bytes(&file_bytes).unwrap_or_else(|e| {
-                            eprintln!("Warning: MCA preprocess failed for {}: {}", fi.rel_path, e);
+                            if !quiet {
+                                eprintln!(
+                                    "Warning: MCA preprocess failed for {}: {}",
+                                    fi.rel_path, e
+                                );
+                            }
                             file_bytes.clone()
                         }),
                         Group::Nbt => preprocess_nbt_from_bytes(&file_bytes).unwrap_or_else(|e| {
-                            eprintln!("Warning: NBT preprocess failed for {}: {}", fi.rel_path, e);
+                            if !quiet {
+                                eprintln!(
+                                    "Warning: NBT preprocess failed for {}: {}",
+                                    fi.rel_path, e
+                                );
+                            }
                             file_bytes.clone()
                         }),
                         Group::Json => {
                             preprocess_json_from_bytes(&file_bytes).unwrap_or_else(|e| {
-                                eprintln!(
-                                    "Warning: JSON preprocess failed for {}: {}",
-                                    fi.rel_path, e
-                                );
+                                if !quiet {
+                                    eprintln!(
+                                        "Warning: JSON preprocess failed for {}: {}",
+                                        fi.rel_path, e
+                                    );
+                                }
                                 file_bytes.clone()
                             })
                         }

@@ -46,7 +46,7 @@ pub enum Commands {
         /// Include session.lock in the archive (excluded by default)
         #[arg(long)]
         include_session_lock: bool,
-        /// Suppress all output (progress bars and summary)
+        /// Suppress all output including progress bars, summary, and non-fatal warnings
         #[arg(short, long)]
         quiet: bool,
         /// Compression algorithm: lzma2 (default) or zstd.
