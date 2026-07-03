@@ -51,7 +51,7 @@ A Minecraft Java Edition save directory looks like this:
 
 ### Key insight: MCA files are internally compressed with a tiny window
 
-Each `.mca` file stores up to 1024 chunks. Each chunk is individually compressed with **zlib deflate** (or zstd in 1.20+). This per-chunk compression resets the LZ dictionary every few kilobytes, which is disastrous for a global compressor. The SBK pipeline strips all inner compression, sorts the raw chunk data by spatial locality, then recompresses the result as a large solid stream — giving LZMA a much larger and more repetitive window to work with.
+Each `.mca` file stores up to 1024 chunks. Each chunk is individually compressed with **zlib deflate** (or LZ4 in vanilla 24w04a+/1.20.5 when enabled). This per-chunk compression resets the LZ dictionary every few kilobytes, which is disastrous for a global compressor. The SBK pipeline strips all inner compression, sorts the raw chunk data by spatial locality, then recompresses the result as a large solid stream — giving LZMA a much larger and more repetitive window to work with.
 
 ---
 
@@ -67,6 +67,8 @@ Every file that passes the compression filters is assigned to exactly one of fou
 | 3        | `RAW`  | everything else                   | No preprocessing, store verbatim                    |
 
 Classification is based purely on file extension. `session.lock` falls into `RAW` and is excluded by default; pass `--include-session-lock` to override.
+
+**Preprocessing fallback:** if MCA, NBT, or JSON preprocessing fails for a file — corrupt data, an unknown chunk compression type, a non-gzip `.dat`, invalid JSON, or any `.mca` smaller than 8192 bytes (too small to hold the location and timestamp tables) — the file is reassigned to the `RAW` group (group 3) and stored verbatim. Extraction restores it byte-identically. The archive format is unchanged by this fallback; the index simply records `group_id = 3` for the affected file.
 
 ---
 
@@ -259,7 +261,7 @@ Bytes 0x0000–0x0FFF   Location table:  1024 × 4-byte entries (big-endian)
 Bytes 0x1000–0x1FFF   Timestamp table: 1024 × 4-byte Unix timestamps (big-endian, seconds)
 Bytes 0x2000–EOF      Chunk data, sector-aligned (each sector = 4096 bytes):
                         [length: u32 BE]          = compressed_data_length + 1
-                        [compression_type: u8]    1=gzip  2=zlib  3=none  4=zstd
+                        [compression_type: u8]    1=gzip  2=zlib  3=none  4=lz4
                         [compressed_data: ...]
 ```
 
@@ -272,13 +274,16 @@ Slot index within the 1024-entry table: `slot = chunk_z_local * 32 + chunk_x_loc
    - Type 1 (gzip): `flate2::read::MultiGzDecoder`
    - Type 2 (zlib): `flate2::read::ZlibDecoder`
    - Type 3 (none): use bytes directly
-   - Type 4 (zstd): pure-Rust zstd decoder. The original compression type is discarded; all chunks are always re-compressed as zlib on reconstruction.
-   - Unknown type: return `Err(SbkError::UnknownChunkCompression(n))`
+   - Type 4 (LZ4, vanilla 24w04a+/1.20.5): Java LZ4Block stream framing, decoded with a pure-Rust LZ4 decoder. The original compression type is discarded; all chunks are always re-compressed as zlib on reconstruction.
+   - Type with high bit set (external `.mcc` oversized chunk): not decoded inline. The whole MCA file falls back to `RAW` storage (lossless, see §3); the sibling `.mcc` file is archived verbatim anyway.
+   - Unknown type: return `Err(SbkError::UnknownChunkCompression(n))` — the file then falls back to `RAW` storage (§3)
 3. Compute local coordinates: `local_x = slot % 32`, `local_z = slot / 32`.
 4. Compute a **Hilbert curve index** for each chunk (see §5.2). Sort ascending. This groups spatially adjacent chunks together in the output byte stream.
 5. Write the **MCAP stream** (§5.3) to an in-memory `Vec<u8>`.
 
 Step 2 is parallelised within a single MCA file using Rayon.
+
+Any `.mca` file smaller than 8192 bytes cannot contain the two header tables and is stored in the `RAW` group verbatim (§3) instead of being preprocessed.
 
 ### 5.2 Hilbert Curve (order 5, 32 × 32 grid)
 
@@ -319,11 +324,11 @@ For each chunk in ascending Hilbert order:
 
 ### 5.4 NBT Preprocessing
 
-Strip the outer gzip layer using `flate2::read::MultiGzDecoder`. Store raw NBT bytes. On reconstruction: re-wrap with `flate2::write::GzEncoder` at level 6.
+Strip the outer gzip layer using `flate2::read::MultiGzDecoder`. Store raw NBT bytes. On reconstruction: re-wrap with `flate2::write::GzEncoder` at level 6. A `.dat`/`.dat_old` file that is not gzip-compressed falls back to `RAW` storage (§3).
 
 ### 5.5 JSON Preprocessing
 
-Parse with `serde_json` into `serde_json::Value`, serialize compactly with `serde_json::to_vec`. On reconstruction: write compact bytes directly (Minecraft accepts compact JSON).
+Parse with `serde_json` into `serde_json::Value`, serialize compactly with `serde_json::to_vec`. Minification removes only insignificant whitespace: key order is preserved and numeric literals are reproduced with their exact original text (`serde_json` with the `preserve_order` and `arbitrary_precision` features). On reconstruction: write compact bytes directly (Minecraft accepts compact JSON). Files that fail to parse as JSON fall back to `RAW` storage (§3).
 
 ### 5.6 Frame-Based Solid Blocks
 
@@ -342,10 +347,10 @@ All frames across all groups and the index block use the **same algorithm**. The
 
 ### 5.7 MCAP Reconstruction (Decompression)
 
-1. Validate 4-byte magic. Read `chunk_count: u16 LE`.
-2. Parse all `(local_x, local_z, raw_nbt)` entries.
+1. Validate 4-byte magic. Read `chunk_count: u16 LE`. Reject streams with `chunk_count > 1024`.
+2. Parse all `(local_x, local_z, raw_nbt)` entries. Reject any entry with `local_x > 31` or `local_z > 31`, and reject duplicate `(local_x, local_z)` slots.
 3. **Parallel chunk re-compression** with Rayon: compress each chunk's NBT using `flate2::write::ZlibEncoder` at level 6. Set `compression_type = 2`.
-4. Lay chunks out starting at sector 2. Compute `required_sectors = ceil((5 + compressed_len) / 4096)`. Zero-pad to sector boundary.
+4. Lay chunks out starting at sector 2. Compute `required_sectors = ceil((5 + compressed_len) / 4096)`. Zero-pad to sector boundary. A chunk requiring more than 255 sectors after recompression is a **hard error** — the MCA location table's 1-byte sector count cannot express it, so failing loudly is required instead of writing a silently corrupt region file.
 5. Build location table: for each occupied `slot = local_z * 32 + local_x`, write `[sector_offset: u24 BE | sector_count: u8]`.
 6. Write zeroed timestamp table (1024 × 4 bytes). Minecraft regenerates on load.
 7. Write all sector data. Caller restores mtime after file is closed.
@@ -411,6 +416,12 @@ Total on disk: 8 bytes magic + 71 bytes header = **79 bytes** before the Frame D
 
 The same algorithm applies uniformly to **all frames and the index block**. There is no per-frame algorithm field.
 
+**Reader validation:** beyond the magic and `header_checksum`, readers reject:
+
+- `frame_size_bytes` of 0 or greater than 1 GiB
+- any Frame Directory entry with `frame_raw_sz > frame_size_bytes`
+- after decompressing the index, any `IndexEntry` with `group_id > 3`, with `stream_offset + stream_raw_size` overflowing `u64`, or whose byte range extends beyond the total uncompressed frame span of its group
+
 ### 6.4 Frame Directory (at `frame_dir_offset`)
 
 Flat list of per-frame metadata for all four groups, in group order 0–3. Enables O(1) seeking to any frame.
@@ -455,13 +466,17 @@ The index contains only files that passed all compression filters. Excluded file
 
 ## 7. Threading Model
 
-`sbk` is designed to saturate all available cores at every stage. The user controls thread count with `--threads N` (default: logical CPU count). One global Rayon thread pool of size N is created once at startup via `build_global()` and reused everywhere, including nested parallel calls.
+`sbk` is designed to saturate all available cores at every stage. The user controls thread count with `--threads N` (default: half of logical cores, min 1). One global Rayon thread pool of size N is created once at startup via `build_global()` and reused everywhere, including nested parallel calls.
 
 ### 7.1 Compression Thread Pipeline
 
 ```
 Stage 1 [parallel, per file]   — enumeration, filtering, preprocessing
   walkdir produces (absolute_path, relative_path, metadata) for every file.
+  walkdir errors and skipped symlinks are warned about and counted — no
+  silent gaps in the archive. If the output path lies inside world_dir,
+  it is skipped during enumeration so the archive never tries to include
+  itself.
   Rayon par_iter() over this list. For each file, each thread independently:
     a. Reads mtime_ms from metadata.
     b. Calls accept(rel_path, mtime_ms, now_ms, max_age_ms, since_ms, &filter).
@@ -492,6 +507,8 @@ Stage 3 [single-threaded, I/O bound]   — finalize
   6. Compute and write header_checksum.
 ```
 
+**Atomic output:** compression writes to a temporary file in the output directory and atomically renames it to the final path only after the archive is complete. A failed or interrupted run never destroys an existing archive at the output path.
+
 ### 7.2 Decompression / Extraction Thread Pipeline
 
 ```
@@ -500,16 +517,21 @@ Stage 1 [single-threaded]   — index and pattern matching
   • Read Frame Directory into memory.
   • Read and decompress Index Block; parse all IndexEntry records.
   • Match requested patterns against all entry paths using glob::Pattern::matches.
+  • Write all zero-byte matched files up front, before any frame work.
 
-Stage 2 [parallel, per unique frame needed]   — frame decompression
+Stage 2 [batched, parallel within each batch]   — frame decompression
   Collect all (group_id, frame_index) pairs from matched entries.
-  Deduplicate into a HashSet. Decompress each unique frame exactly once, in parallel.
-  Store results in HashMap<(u8, u32), Vec<u8>>.
-  This map is fully built and read-only before Stage 3 begins — no locking needed.
+  Deduplicate. Frames are then processed in batches of N (= thread count):
+  each batch's compressed bytes are read sequentially (checksum-verified),
+  then decompressed in parallel. Each unique frame is decompressed exactly
+  once.
 
 Stage 3 [parallel, per matched file]   — reconstruction and writing
-  matched_entries.par_iter(). For each entry:
-    • Slice preprocessed bytes from the frame map via slice_from_frames() (lock-free).
+  Interleaved with Stage 2: as soon as every frame a file needs is
+  available, the file is reconstructed and written. Decompressed frames
+  are evicted from memory once no unwritten file still needs them, so
+  peak memory stays bounded regardless of archive size. For each entry:
+    • Slice preprocessed bytes from the available frames via slice_from_frames().
     • Call the appropriate reconstruct_*().
     • Create parent directories via a Mutex<HashSet<PathBuf>> cache.
     • Write output file.
@@ -523,7 +545,7 @@ Stage 3a [parallel, per chunk within one MCA reconstruction]
 
 - **File handles**: each thread writes to its own output file. No sharing.
 - **Directory creation**: `Mutex<HashSet<PathBuf>>` guards `create_dir_all`. Without this, concurrent threads may race creating the same parent directory.
-- **Frame cache**: `HashMap<(u8, u32), Vec<u8>>` is fully populated before Stage 3 and is read-only thereafter. No locking needed.
+- **Frame cache**: decompressed frames live in a batch-scoped cache. Frames are added as their batch is decompressed and evicted as soon as no unwritten file references them, bounding peak memory to roughly one batch of frames plus in-flight reconstructions.
 - **Skip counter**: `std::sync::atomic::AtomicU64` counts filtered-out files from multiple threads without a mutex.
 - **Progress bars**: `indicatif::ProgressBar` is `Send + Sync`. Clone the handle and call `.inc(1)` from any thread.
 - **Rayon nesting**: one global pool handles both outer (per-file) and inner (per-chunk) parallelism via work-stealing. No thread over-subscription occurs.
@@ -584,8 +606,8 @@ USAGE:
 
 COMPRESS OPTIONS:
   -o, --output  <file.sbk>           Default: <world_dir_name>.sbk in current dir
-  -t, --threads <n>                  Default: logical CPU count
-  -l, --level     <1-9>              Compression level; default 9. For zstd, mapped to 3–19 internally.
+  -t, --threads <n>                  Default: half of logical cores (min 1)
+  -l, --level     <1-9>              Compression level; default 3. For zstd, mapped to 3–19 internally.
       --algorithm <lzma2|zstd>       Compression algorithm; default lzma2
       --max-age   <ms>               Skip files not modified within the last N milliseconds
       --since    <timestamp>         Skip files with mtime below this millisecond Unix timestamp
@@ -597,24 +619,27 @@ COMPRESS OPTIONS:
 
 DECOMPRESS OPTIONS:
   -o, --output  <dir>                Default: <world_name>/ in current dir
-  -t, --threads <n>                  Default: logical CPU count
+  -t, --threads <n>                  Default: half of logical cores (min 1)
   -q, --quiet                        Suppress output
 
 EXTRACT OPTIONS:
   <pattern>...                       One or more exact paths or glob patterns (required)
   -o, --output  <dir>                Default: current dir; preserves subdirectory structure
-  -t, --threads <n>                  Default: logical CPU count
+  -t, --threads <n>                  Default: half of logical cores (min 1)
   -q, --quiet                        Suppress output
 
 INFO OPTIONS:
   --list                             Print full file manifest table
+
+VERIFY OPTIONS:
+  -t, --threads <n>                  Default: half of logical cores (min 1); used for parallel frame hashing
 
 CONVERT OPTIONS:
   <archive>                          Input: .sbk, .zip, .tar.gz, or .tar.xz — format auto-detected
   --to <format>                      Target: zip, tar.gz, tar.xz (required when input is SBK)
                                      Omit when input is zip/tar to convert to SBK automatically
   -o, --output  <file>               Default: <archive_stem>.<ext> in current dir
-  -t, --threads <n>                  Default: logical CPU count
+  -t, --threads <n>                  Default: half of logical cores (min 1)
   -l, --level   <1-9>                Compression level for the output format; default 6
   -a, --algorithm <lzma2|zstd>       Algorithm for output SBK only; default lzma2
 
@@ -624,8 +649,11 @@ NOTES:
   Files excluded during compression are absent from the archive and cannot be extracted.
   session.lock is excluded by default; use --include-session-lock to override.
   sbk convert detects the input format from the file extension (.sbk, .zip, .tar.gz, .tar.xz).
-    SBK → other: reconstructs files in memory and streams into the output archive.
+    SBK → other: streams entries in stream order (group, then stream offset) with a bounded
+    frame cache, so output archive member order may differ from path order.
     other → SBK: extracts to a temp dir, then compresses with the same pipeline as sbk compress.
+    zip → SBK preserves each zip entry's mtime, and rejects zip entries whose names would
+    escape the extraction directory (zip-slip guard).
 ```
 
 ### 9.1 Startup Validation (compress)

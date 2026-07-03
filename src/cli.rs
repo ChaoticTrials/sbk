@@ -2,10 +2,33 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 
+fn threads_for_parallelism(n: usize) -> usize {
+    (n / 2).max(1)
+}
+
 fn default_threads() -> usize {
     std::thread::available_parallelism()
-        .map(|n| n.get() / 2)
+        .map(|n| threads_for_parallelism(n.get()))
         .unwrap_or(4)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_threads_is_at_least_one() {
+        assert!(default_threads() >= 1);
+    }
+
+    #[test]
+    fn threads_for_parallelism_never_zero() {
+        // Single-core machine must not produce 0 threads (rayon would
+        // silently pick its own count).
+        assert_eq!(threads_for_parallelism(1), 1);
+        assert!(threads_for_parallelism(2) >= 1);
+        assert_eq!(threads_for_parallelism(8), 4);
+    }
 }
 
 #[derive(Parser)]
@@ -24,7 +47,7 @@ pub enum Commands {
         /// Output archive path (default: <world_dir_name>.sbk)
         #[arg(short, long)]
         output: Option<PathBuf>,
-        /// Number of threads (default: logical CPU count)
+        /// Number of threads (default: half of logical cores, min 1)
         #[arg(short, long, default_value_t = default_threads())]
         threads: usize,
         /// LZMA preset level 1–9 (default: 3)
@@ -69,7 +92,7 @@ pub enum Commands {
         /// Output directory (default: <archive_stem>/ in current dir)
         #[arg(short, long)]
         output: Option<PathBuf>,
-        /// Number of threads (default: logical CPU count)
+        /// Number of threads (default: half of logical cores, min 1)
         #[arg(short, long, default_value_t = default_threads())]
         threads: usize,
         /// Suppress all output
@@ -86,7 +109,7 @@ pub enum Commands {
         /// Output directory (default: current dir)
         #[arg(short, long)]
         output: Option<PathBuf>,
-        /// Number of threads (default: logical CPU count)
+        /// Number of threads (default: half of logical cores, min 1)
         #[arg(short, long, default_value_t = default_threads())]
         threads: usize,
         /// Suppress all output
@@ -105,7 +128,7 @@ pub enum Commands {
     Verify {
         /// Path to the SBK archive
         archive: PathBuf,
-        /// Number of threads (default: logical CPU count)
+        /// Number of threads (default: half of logical cores, min 1)
         #[arg(short, long, default_value_t = default_threads())]
         threads: usize,
     },
@@ -119,7 +142,7 @@ pub enum Commands {
         /// Output file path (default: <archive_stem>.<ext> in current dir)
         #[arg(short, long)]
         output: Option<PathBuf>,
-        /// Number of threads (default: logical CPU count)
+        /// Number of threads (default: half of logical cores, min 1)
         #[arg(short, long, default_value_t = default_threads())]
         threads: usize,
         /// Compression level 1–9 for the output format (default: 6)
