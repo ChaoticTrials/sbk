@@ -1,6 +1,7 @@
 use crate::checksum::hash;
 use crate::codec::Codec;
 use crate::error::SbkError;
+use crate::format::frame_dir::FrameDir;
 use std::io::{Read, Write};
 
 /// One entry in the Index Block.
@@ -153,6 +154,52 @@ fn parse_raw(data: &[u8]) -> anyhow::Result<Vec<IndexEntry>> {
     }
 
     Ok(entries)
+}
+
+/// Validate index entries against the frame directory.
+///
+/// Rejects entries whose `group_id` is out of range, whose stream range
+/// overflows u64, or whose stream extends past the raw data actually covered
+/// by the group's frames. Callers should invoke this right after `read_index`
+/// so later arithmetic (frame ranges, `Vec::with_capacity`) is safe.
+pub fn validate_entries(
+    entries: &[IndexEntry],
+    frame_dir: &FrameDir,
+    frame_size: u64,
+) -> anyhow::Result<()> {
+    for e in entries {
+        if e.group_id > 3 {
+            return Err(anyhow::anyhow!(
+                "index entry '{}' has invalid group_id {}",
+                e.path,
+                e.group_id
+            ));
+        }
+        let end = e
+            .stream_offset
+            .checked_add(e.stream_raw_size)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "index entry '{}' stream range overflows (offset {} + size {})",
+                    e.path,
+                    e.stream_offset,
+                    e.stream_raw_size
+                )
+            })?;
+        let frames_in_group = frame_dir.groups[e.group_id as usize].len() as u64;
+        if end > frames_in_group * frame_size {
+            return Err(anyhow::anyhow!(
+                "index entry '{}' stream range {}..{} exceeds group {} data ({} frame(s) × {} bytes)",
+                e.path,
+                e.stream_offset,
+                end,
+                e.group_id,
+                frames_in_group,
+                frame_size
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Find an entry by exact path match.

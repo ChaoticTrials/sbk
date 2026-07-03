@@ -5,6 +5,11 @@ use std::io::{Read, Seek, SeekFrom, Write};
 pub const MAGIC: [u8; 8] = [0x53, 0x42, 0x4B, 0x21, 0x56, 0x31, 0x0D, 0x0A]; // "SBK!V1\r\n"
 pub const HEADER_DISK_SIZE: usize = 79;
 
+/// Maximum accepted frame size (1 GiB). Frames are 16 MiB in practice; anything
+/// larger indicates corruption. Also guards against division by zero when the
+/// header declares a zero frame size.
+pub const MAX_FRAME_SIZE_BYTES: u64 = 1024 * 1024 * 1024;
+
 /// Compression algorithm used for all data frames and the index block.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -130,12 +135,21 @@ pub fn read_header(r: &mut (impl Read + Seek)) -> anyhow::Result<Header> {
         ));
     }
 
+    let frame_size_bytes = u64::from_le_bytes(buf[23..31].try_into().unwrap());
+    if frame_size_bytes == 0 || frame_size_bytes > MAX_FRAME_SIZE_BYTES {
+        return Err(anyhow::anyhow!(
+            "invalid frame size {} in header (must be between 1 and {} bytes)",
+            frame_size_bytes,
+            MAX_FRAME_SIZE_BYTES
+        ));
+    }
+
     Ok(Header {
         format_version,
         flags: buf[9],
         algorithm,
         file_count: u64::from_le_bytes(buf[15..23].try_into().unwrap()),
-        frame_size_bytes: u64::from_le_bytes(buf[23..31].try_into().unwrap()),
+        frame_size_bytes,
         frame_dir_offset: u64::from_le_bytes(buf[31..39].try_into().unwrap()),
         frame_dir_size: u64::from_le_bytes(buf[39..47].try_into().unwrap()),
         index_offset: u64::from_le_bytes(buf[47..55].try_into().unwrap()),

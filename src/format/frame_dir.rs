@@ -65,7 +65,11 @@ pub fn write_frame_dir(w: &mut impl Write, fd: &FrameDir) -> anyhow::Result<()> 
 const MAX_FRAMES_PER_GROUP: usize = 1_000_000;
 
 /// Read the Frame Directory from `r`.
-pub fn read_frame_dir(r: &mut impl Read) -> anyhow::Result<FrameDir> {
+///
+/// `frame_size` is the header's `frame_size_bytes`; any frame declaring a raw
+/// (decompressed) size larger than it is rejected, bounding decompression
+/// allocations to one frame each.
+pub fn read_frame_dir(r: &mut impl Read, frame_size: u64) -> anyhow::Result<FrameDir> {
     let mut fd = FrameDir::new();
     for g in 0..4usize {
         let mut count_buf = [0u8; 4];
@@ -87,6 +91,15 @@ pub fn read_frame_dir(r: &mut impl Read) -> anyhow::Result<FrameDir> {
             let frame_compressed_sz = u32::from_le_bytes(buf[8..12].try_into().unwrap());
             let frame_raw_sz = u32::from_le_bytes(buf[12..16].try_into().unwrap());
             let frame_checksum = u32::from_le_bytes(buf[16..20].try_into().unwrap());
+            if frame_raw_sz as u64 > frame_size {
+                return Err(anyhow::anyhow!(
+                    "frame {} in group {} declares raw size {} exceeding frame size {}",
+                    fd.groups[g].len(),
+                    g,
+                    frame_raw_sz,
+                    frame_size
+                ));
+            }
             fd.groups[g].push(FrameEntry {
                 frame_offset,
                 frame_compressed_sz,

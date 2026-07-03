@@ -877,7 +877,8 @@ fn test27_malicious_frame_count_rejected() {
     let mut data = Vec::new();
     data.extend_from_slice(&1_000_001u32.to_le_bytes());
 
-    let result = sbk::format::frame_dir::read_frame_dir(&mut Cursor::new(data));
+    let result =
+        sbk::format::frame_dir::read_frame_dir(&mut Cursor::new(data), sbk::solid::FRAME_SIZE);
     assert!(result.is_err());
     let msg = result.unwrap_err().to_string();
     assert!(

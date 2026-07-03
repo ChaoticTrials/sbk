@@ -11,7 +11,7 @@ use crate::codec;
 use crate::error::SbkError;
 use crate::format::frame_dir::read_frame_dir;
 use crate::format::header::read_header;
-use crate::format::index::{IndexEntry, read_index};
+use crate::format::index::{IndexEntry, read_index, validate_entries};
 use crate::preprocess::{mca::reconstruct_mca_bytes, nbt::reconstruct_nbt_bytes};
 use crate::solid::extractor::slice_from_frames;
 
@@ -88,13 +88,31 @@ pub fn convert_to_sbk(
                 if entry.is_dir() {
                     continue;
                 }
-                let out_path = temp_dir.path().join(entry.name());
+                // Zip-slip guard: `enclosed_name()` rejects absolute paths and
+                // `..` components that would escape the extraction directory.
+                let rel_path = entry.enclosed_name().ok_or_else(|| {
+                    anyhow::anyhow!("zip entry has unsafe path: '{}'", entry.name())
+                })?;
+                let out_path = temp_dir.path().join(rel_path);
                 if let Some(parent) = out_path.parent() {
                     std::fs::create_dir_all(parent)?;
                 }
                 let mut out_file = File::create(&out_path)
                     .with_context(|| format!("failed to create '{}'", out_path.display()))?;
                 std::io::copy(&mut entry, &mut out_file)?;
+                drop(out_file);
+                // Restore the entry's mtime (assumed UTC) so it survives into
+                // the SBK index. Entries without a valid datetime keep the
+                // extraction time.
+                if let Some(dt) = entry.last_modified() {
+                    if let Ok(pdt) = time::PrimitiveDateTime::try_from(dt) {
+                        let secs = pdt.assume_utc().unix_timestamp();
+                        let ft = filetime::FileTime::from_unix_time(secs, 0);
+                        filetime::set_file_mtime(&out_path, ft).with_context(|| {
+                            format!("failed to set mtime on '{}'", out_path.display())
+                        })?;
+                    }
+                }
             }
         }
         ConvertFormat::TarGz => {
@@ -165,8 +183,10 @@ pub fn convert_from_sbk(
     let header = read_header(&mut f)?;
     let codec = codec::from_algorithm(header.algorithm);
 
+    let frame_size = header.frame_size_bytes;
+
     f.seek(SeekFrom::Start(header.frame_dir_offset))?;
-    let frame_dir = read_frame_dir(&mut f)?;
+    let frame_dir = read_frame_dir(&mut f, frame_size)?;
 
     f.seek(SeekFrom::Start(header.index_offset))?;
     let all_entries = read_index(
@@ -175,6 +195,7 @@ pub fn convert_from_sbk(
         header.index_compressed_size,
         header.index_checksum,
     )?;
+    validate_entries(&all_entries, &frame_dir, frame_size)?;
 
     // Path traversal guard: reject absolute paths and `..` components
     for entry in &all_entries {
@@ -195,51 +216,139 @@ pub fn convert_from_sbk(
         }
     }
 
-    if all_entries.is_empty() {
-        // Create an empty archive
-        let out = File::create(output)
-            .with_context(|| format!("failed to create output '{}'", output.display()))?;
-        match format {
-            ConvertFormat::Zip => {
-                let zip = zip::ZipWriter::new(out);
-                zip.finish()?;
-            }
-            ConvertFormat::TarGz => {
-                let encoder = flate2::write::GzEncoder::new(out, flate2::Compression::new(level));
-                let mut tar = tar::Builder::new(encoder);
-                tar.finish()?;
-            }
-            ConvertFormat::TarXz => {
-                let encoder = xz2::write::XzEncoder::new(out, level);
-                let mut tar = tar::Builder::new(encoder);
-                tar.finish()?;
-            }
-            ConvertFormat::Sbk => {
-                return Err(anyhow::anyhow!(
-                    "cannot convert SBK to SBK: use a different --to format"
-                ));
-            }
-        }
-        return Ok(0);
-    }
+    // Stage 2: stream entries into the target archive with bounded memory.
+    //
+    // Entries are processed in (group_id, stream_offset) order — the order
+    // their bytes appear in the frame streams — so frames can be loaded once,
+    // in batches of `threads`, and evicted as soon as no later entry needs
+    // them. Peak memory is O(threads × frame_size) plus the largest single
+    // file, not O(archive). Note this writes archive members in stream order,
+    // which may differ from the index (path) order.
+    let mut sorted_entries: Vec<IndexEntry> = all_entries.clone();
+    sorted_entries.sort_by(|a, b| {
+        (a.group_id, a.stream_offset, &a.path).cmp(&(b.group_id, b.stream_offset, &b.path))
+    });
 
-    // Stage 2: collect unique frames needed, read + verify + decompress them
-    let frame_size = header.frame_size_bytes;
-    let mut unique_frames: HashSet<(u8, u32)> = HashSet::new();
-    for entry in &all_entries {
+    // Ordered load schedule of all unique frames needed.
+    let mut needed_set: HashSet<(u8, u32)> = HashSet::new();
+    for entry in &sorted_entries {
         if entry.stream_raw_size == 0 {
             continue;
         }
         let start = (entry.stream_offset / frame_size) as u32;
         let end = ((entry.stream_offset + entry.stream_raw_size - 1) / frame_size) as u32;
         for fi in start..=end {
-            unique_frames.insert((entry.group_id, fi));
+            let group_frames = &frame_dir.groups[entry.group_id as usize];
+            if fi as usize >= group_frames.len() {
+                return Err(anyhow::anyhow!(
+                    "frame index {} out of bounds for group {}",
+                    fi,
+                    entry.group_id
+                ));
+            }
+            needed_set.insert((entry.group_id, fi));
+        }
+    }
+    let mut needed_frames: Vec<(u8, u32)> = needed_set.into_iter().collect();
+    needed_frames.sort_unstable();
+
+    let out = File::create(output)
+        .with_context(|| format!("failed to create output '{}'", output.display()))?;
+    let mut sink: Box<dyn EntrySink> = match format {
+        ConvertFormat::Zip => Box::new(ZipSink {
+            writer: zip::ZipWriter::new(out),
+            level,
+        }),
+        ConvertFormat::TarGz => Box::new(TarSink {
+            builder: tar::Builder::new(flate2::write::GzEncoder::new(
+                out,
+                flate2::Compression::new(level),
+            )),
+        }),
+        ConvertFormat::TarXz => Box::new(TarSink {
+            builder: tar::Builder::new(xz2::write::XzEncoder::new(out, level)),
+        }),
+        ConvertFormat::Sbk => {
+            return Err(anyhow::anyhow!(
+                "cannot convert SBK to SBK: use a different --to format"
+            ));
+        }
+    };
+
+    let batch_size = threads.max(1);
+    let mut cache: HashMap<(u8, u32), Vec<u8>> = HashMap::new();
+    let mut cursor = 0usize; // next unloaded frame in `needed_frames`
+
+    for (idx, e) in sorted_entries.iter().enumerate() {
+        // Load frame batches until this entry's last frame is cached. Frames
+        // are loaded in sorted order, matching the sorted entry order, so the
+        // entry's earlier frames are already cached (or still retained).
+        if e.stream_raw_size > 0 {
+            let end_frame = ((e.stream_offset + e.stream_raw_size - 1) / frame_size) as u32;
+            let last_key = (e.group_id, end_frame);
+            while !cache.contains_key(&last_key) {
+                if cursor >= needed_frames.len() {
+                    return Err(anyhow::anyhow!(
+                        "frame ({},{}) missing from load schedule (corrupt index?)",
+                        last_key.0,
+                        last_key.1
+                    ));
+                }
+                let end = (cursor + batch_size).min(needed_frames.len());
+                load_frame_batch(
+                    &mut f,
+                    &frame_dir,
+                    &*codec,
+                    &needed_frames[cursor..end],
+                    &mut cache,
+                )?;
+                cursor = end;
+            }
+        }
+
+        let preprocessed = slice_from_frames(
+            &cache,
+            e.group_id,
+            e.stream_offset,
+            e.stream_raw_size,
+            frame_size,
+        )?;
+        let reconstructed = reconstruct_bytes(e.group_id, &preprocessed)
+            .with_context(|| format!("failed to reconstruct '{}'", e.path))?;
+        sink.add(e, &reconstructed)?;
+
+        // Evict frames no later entry needs: with entries sorted by
+        // (group_id, stream_offset), every frame of an earlier group and
+        // every frame before the next entry's start frame is done.
+        if let Some(next) = sorted_entries.get(idx + 1) {
+            let next_start = (next.stream_offset / frame_size) as u32;
+            cache.retain(|&(g, fi), _| {
+                g > next.group_id || (g == next.group_id && fi >= next_start)
+            });
+        } else {
+            cache.clear();
         }
     }
 
-    // Read compressed frames sequentially
-    let mut frame_data_map: HashMap<(u8, u32), Vec<u8>> = HashMap::new();
-    for &(group_id, frame_idx) in &unique_frames {
+    sink.finish()?;
+
+    Ok(sorted_entries.len() as u64)
+}
+
+/// Read (sequentially), checksum-verify, and decompress (in parallel) one
+/// batch of frames into `cache`.
+fn load_frame_batch(
+    f: &mut File,
+    frame_dir: &crate::format::frame_dir::FrameDir,
+    codec: &dyn crate::codec::Codec,
+    batch: &[(u8, u32)],
+    cache: &mut HashMap<(u8, u32), Vec<u8>>,
+) -> anyhow::Result<()> {
+    use rayon::prelude::*;
+
+    // Phase A: sequential read + checksum verification
+    let mut compressed: Vec<((u8, u32), u32, Vec<u8>)> = Vec::with_capacity(batch.len());
+    for &(group_id, frame_idx) in batch {
         let group_frames = &frame_dir.groups[group_id as usize];
         if frame_idx as usize >= group_frames.len() {
             return Err(anyhow::anyhow!(
@@ -261,95 +370,85 @@ pub fn convert_from_sbk(
         let mut buf = vec![0u8; entry.frame_compressed_sz as usize];
         f.seek(SeekFrom::Start(entry.frame_offset))?;
         f.read_exact(&mut buf)?;
-
-        // Verify checksum
         if hash(&buf) != entry.frame_checksum {
             return Err(SbkError::FrameChecksumMismatch(frame_idx).into());
         }
-
-        frame_data_map.insert((group_id, frame_idx), buf);
+        compressed.push(((group_id, frame_idx), entry.frame_raw_sz, buf));
     }
 
-    // Decompress frames (using rayon for parallelism)
-    use rayon::prelude::*;
-    let frame_raw_sz_map: HashMap<(u8, u32), u32> = unique_frames
-        .iter()
-        .map(|&(group_id, frame_idx)| {
-            let entry = &frame_dir.groups[group_id as usize][frame_idx as usize];
-            ((group_id, frame_idx), entry.frame_raw_sz)
-        })
-        .collect();
-
-    let decompressed_frames: HashMap<(u8, u32), Vec<u8>> = frame_data_map
+    // Phase B: decompress the batch in parallel
+    let decompressed: Vec<((u8, u32), Vec<u8>)> = compressed
         .par_iter()
-        .map(|(&key, compressed)| {
-            let expected_raw_sz = frame_raw_sz_map[&key];
-            let raw = codec.decompress(compressed, expected_raw_sz).map_err(|e| {
+        .map(|(key, raw_sz, buf)| {
+            let raw = codec.decompress(buf, *raw_sz).map_err(|e| {
                 anyhow::anyhow!("frame ({},{}) decompression failed: {}", key.0, key.1, e)
             })?;
-            Ok((key, raw))
+            Ok((*key, raw))
         })
         .collect::<anyhow::Result<_>>()?;
 
-    // Stage 3: write to target format
-    let out = File::create(output)
-        .with_context(|| format!("failed to create output '{}'", output.display()))?;
-
-    let n = all_entries.len() as u64;
-
-    match format {
-        ConvertFormat::Zip => {
-            write_zip(out, &all_entries, &decompressed_frames, frame_size, level)?
-        }
-        ConvertFormat::TarGz => {
-            let encoder = flate2::write::GzEncoder::new(out, flate2::Compression::new(level));
-            write_tar(encoder, &all_entries, &decompressed_frames, frame_size)?;
-        }
-        ConvertFormat::TarXz => {
-            let encoder = xz2::write::XzEncoder::new(out, level);
-            write_tar(encoder, &all_entries, &decompressed_frames, frame_size)?;
-        }
-        ConvertFormat::Sbk => {
-            return Err(anyhow::anyhow!(
-                "cannot convert SBK to SBK: use a different --to format"
-            ));
-        }
+    for (key, raw) in decompressed {
+        cache.insert(key, raw);
     }
-
-    Ok(n)
+    Ok(())
 }
 
-fn write_zip<W: Write + Seek>(
-    out: W,
-    entries: &[IndexEntry],
-    frames: &HashMap<(u8, u32), Vec<u8>>,
-    frame_size: u64,
+/// Streaming sink over the supported target archive writers.
+trait EntrySink {
+    fn add(&mut self, entry: &IndexEntry, data: &[u8]) -> anyhow::Result<()>;
+    fn finish(self: Box<Self>) -> anyhow::Result<()>;
+}
+
+struct ZipSink {
+    writer: zip::ZipWriter<File>,
     level: u32,
-) -> anyhow::Result<()> {
-    use zip::CompressionMethod;
-    use zip::write::SimpleFileOptions;
+}
 
-    let options = SimpleFileOptions::default()
-        .compression_method(CompressionMethod::Deflated)
-        .compression_level(Some(level as i64));
+impl EntrySink for ZipSink {
+    fn add(&mut self, entry: &IndexEntry, data: &[u8]) -> anyhow::Result<()> {
+        use zip::CompressionMethod;
+        use zip::write::SimpleFileOptions;
 
-    let mut zip = zip::ZipWriter::new(out);
-    for e in entries {
-        let preprocessed = slice_from_frames(
-            frames,
-            e.group_id,
-            e.stream_offset,
-            e.stream_raw_size,
-            frame_size,
-        )?;
-        let reconstructed = reconstruct_bytes(e.group_id, &preprocessed)
-            .with_context(|| format!("failed to reconstruct '{}'", e.path))?;
-        let opts = options.last_modified_time(mtime_to_zip_datetime(e.mtime_ms));
-        zip.start_file(&e.path, opts)?;
-        zip.write_all(&reconstructed)?;
+        let opts = SimpleFileOptions::default()
+            .compression_method(CompressionMethod::Deflated)
+            .compression_level(Some(self.level as i64))
+            .last_modified_time(mtime_to_zip_datetime(entry.mtime_ms));
+        self.writer.start_file(&entry.path, opts)?;
+        self.writer.write_all(data)?;
+        Ok(())
     }
-    zip.finish()?;
-    Ok(())
+
+    fn finish(self: Box<Self>) -> anyhow::Result<()> {
+        self.writer.finish()?;
+        Ok(())
+    }
+}
+
+struct TarSink<W: Write> {
+    builder: tar::Builder<W>,
+}
+
+impl<W: Write> EntrySink for TarSink<W> {
+    fn add(&mut self, entry: &IndexEntry, data: &[u8]) -> anyhow::Result<()> {
+        let mut header = tar::Header::new_gnu();
+        header.set_size(data.len() as u64);
+        // mtime in seconds; clamp negatives to 0
+        let mtime_secs = if entry.mtime_ms >= 0 {
+            (entry.mtime_ms / 1000) as u64
+        } else {
+            0
+        };
+        header.set_mtime(mtime_secs);
+        header.set_mode(0o644);
+        header.set_cksum();
+        self.builder.append_data(&mut header, &entry.path, data)?;
+        Ok(())
+    }
+
+    fn finish(mut self: Box<Self>) -> anyhow::Result<()> {
+        self.builder.finish()?;
+        Ok(())
+    }
 }
 
 fn mtime_to_zip_datetime(mtime_ms: i64) -> zip::DateTime {
@@ -368,38 +467,4 @@ fn mtime_to_zip_datetime(mtime_ms: i64) -> zip::DateTime {
         }
         None => zip::DateTime::default(),
     }
-}
-
-fn write_tar<W: Write>(
-    writer: W,
-    entries: &[IndexEntry],
-    frames: &HashMap<(u8, u32), Vec<u8>>,
-    frame_size: u64,
-) -> anyhow::Result<()> {
-    let mut tar = tar::Builder::new(writer);
-    for e in entries {
-        let preprocessed = slice_from_frames(
-            frames,
-            e.group_id,
-            e.stream_offset,
-            e.stream_raw_size,
-            frame_size,
-        )?;
-        let reconstructed = reconstruct_bytes(e.group_id, &preprocessed)
-            .with_context(|| format!("failed to reconstruct '{}'", e.path))?;
-        let mut header = tar::Header::new_gnu();
-        header.set_size(reconstructed.len() as u64);
-        // mtime in seconds; clamp negatives to 0
-        let mtime_secs = if e.mtime_ms >= 0 {
-            (e.mtime_ms / 1000) as u64
-        } else {
-            0
-        };
-        header.set_mtime(mtime_secs);
-        header.set_mode(0o644);
-        header.set_cksum();
-        tar.append_data(&mut header, &e.path, reconstructed.as_slice())?;
-    }
-    tar.finish()?;
-    Ok(())
 }

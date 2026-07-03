@@ -28,6 +28,16 @@ pub fn slice_from_frames(
         } else {
             frame.len()
         };
+        if s > frame.len() || e > frame.len() || s > e {
+            return Err(anyhow::anyhow!(
+                "frame ({},{}) is shorter than expected: need bytes {}..{}, frame has {}",
+                group_id,
+                fi,
+                s,
+                e,
+                frame.len()
+            ));
+        }
         result.extend_from_slice(&frame[s..e]);
     }
     Ok(result)

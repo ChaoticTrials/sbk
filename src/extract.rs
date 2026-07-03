@@ -14,7 +14,7 @@ use crate::codec;
 use crate::error::SbkError;
 use crate::format::frame_dir::read_frame_dir;
 use crate::format::header::read_header;
-use crate::format::index::{find_patterns, read_index};
+use crate::format::index::{find_patterns, read_index, validate_entries};
 use crate::preprocess::{json::reconstruct_json, mca::reconstruct_mca, nbt::reconstruct_nbt};
 use crate::solid::extractor::slice_from_frames;
 
@@ -68,8 +68,10 @@ where
         crate::format::header::Algorithm::Zstd => "ZSTD Decode  ",
     };
 
+    let frame_size = header.frame_size_bytes;
+
     f.seek(SeekFrom::Start(header.frame_dir_offset))?;
-    let frame_dir = read_frame_dir(&mut f)?;
+    let frame_dir = read_frame_dir(&mut f, frame_size)?;
 
     f.seek(SeekFrom::Start(header.index_offset))?;
     let all_entries = read_index(
@@ -78,6 +80,7 @@ where
         header.index_compressed_size,
         header.index_checksum,
     )?;
+    validate_entries(&all_entries, &frame_dir, frame_size)?;
 
     // Match patterns
     let matched = find_patterns(&all_entries, patterns)?;
@@ -110,7 +113,6 @@ where
     }
 
     // Collect unique frames needed, with per-entry tracking and reference counts.
-    let frame_size = header.frame_size_bytes;
     let mut frames_needed: Vec<HashSet<(u8, u32)>> = Vec::with_capacity(matched.len());
     let mut frame_refcount: HashMap<(u8, u32), usize> = HashMap::new();
 
@@ -161,6 +163,69 @@ where
     let created_dirs: Mutex<HashSet<PathBuf>> = Mutex::new(HashSet::new());
     let mut frames_read: usize = 0;
     let decode_count = AtomicUsize::new(0);
+
+    // Shared write logic for one matched entry (Phase C and the zero-size
+    // pre-pass below). `frames` holds the decompressed frames the entry needs.
+    let write_entry = |i: usize, frames: &HashMap<(u8, u32), Vec<u8>>| -> anyhow::Result<()> {
+        let entry = &matched[i];
+        let preprocessed = slice_from_frames(
+            frames,
+            entry.group_id,
+            entry.stream_offset,
+            entry.stream_raw_size,
+            frame_size,
+        )?;
+        let out_path = output_dir.join(&entry.path);
+        if let Some(parent) = out_path.parent() {
+            let needs_create = {
+                let dirs = created_dirs.lock().unwrap();
+                !dirs.contains(parent)
+            };
+            if needs_create {
+                std::fs::create_dir_all(parent)?;
+                let mut dirs = created_dirs.lock().unwrap();
+                dirs.insert(parent.to_path_buf());
+            }
+        }
+        let group = Group::from_u8(entry.group_id)
+            .ok_or_else(|| anyhow::anyhow!("unknown group_id {}", entry.group_id))?;
+        match group {
+            Group::Mca => reconstruct_mca(&preprocessed, &out_path)?,
+            Group::Nbt => reconstruct_nbt(&preprocessed, &out_path)?,
+            Group::Json => reconstruct_json(&preprocessed, &out_path)?,
+            Group::Raw => std::fs::write(&out_path, &preprocessed)?,
+        }
+        let ft = filetime::FileTime::from_unix_time(
+            entry.mtime_ms / 1000,
+            ((entry.mtime_ms % 1000) * 1_000_000) as u32,
+        );
+        filetime::set_file_mtime(&out_path, ft)?;
+        bar_write.inc(1);
+        let n = completed.fetch_add(1, Ordering::Relaxed) + 1;
+        if !on_progress("write", n, total_files) {
+            return Err(anyhow::anyhow!("cancelled"));
+        }
+        Ok(())
+    };
+
+    // Zero-size entries need no frames, so the frame loop below may never run
+    // (e.g. an archive containing only empty files). Write them up front.
+    let empty_indices: Vec<usize> = matched
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| e.stream_raw_size == 0)
+        .map(|(i, _)| i)
+        .collect();
+    let empty_results: Vec<anyhow::Result<()>> = empty_indices
+        .par_iter()
+        .map(|&i| write_entry(i, &decompressed_frames))
+        .collect();
+    for r in empty_results {
+        r?;
+    }
+    for &i in &empty_indices {
+        entry_written[i] = true;
+    }
 
     for chunk in unique_frames_sorted.chunks(batch_size) {
         // --- Phase A: read compressed bytes sequentially ---
@@ -245,47 +310,7 @@ where
 
         let write_results: Vec<anyhow::Result<()>> = ready_indices
             .par_iter()
-            .map(|&i| {
-                let entry = &matched[i];
-                let preprocessed = slice_from_frames(
-                    &decompressed_frames,
-                    entry.group_id,
-                    entry.stream_offset,
-                    entry.stream_raw_size,
-                    frame_size,
-                )?;
-                let out_path = output_dir.join(&entry.path);
-                if let Some(parent) = out_path.parent() {
-                    let needs_create = {
-                        let dirs = created_dirs.lock().unwrap();
-                        !dirs.contains(parent)
-                    };
-                    if needs_create {
-                        std::fs::create_dir_all(parent)?;
-                        let mut dirs = created_dirs.lock().unwrap();
-                        dirs.insert(parent.to_path_buf());
-                    }
-                }
-                let group = Group::from_u8(entry.group_id)
-                    .ok_or_else(|| anyhow::anyhow!("unknown group_id {}", entry.group_id))?;
-                match group {
-                    Group::Mca => reconstruct_mca(&preprocessed, &out_path)?,
-                    Group::Nbt => reconstruct_nbt(&preprocessed, &out_path)?,
-                    Group::Json => reconstruct_json(&preprocessed, &out_path)?,
-                    Group::Raw => std::fs::write(&out_path, &preprocessed)?,
-                }
-                let ft = filetime::FileTime::from_unix_time(
-                    entry.mtime_ms / 1000,
-                    ((entry.mtime_ms % 1000) * 1_000_000) as u32,
-                );
-                filetime::set_file_mtime(&out_path, ft)?;
-                bar_write.inc(1);
-                let n = completed.fetch_add(1, Ordering::Relaxed) + 1;
-                if !on_progress("write", n, total_files) {
-                    return Err(anyhow::anyhow!("cancelled"));
-                }
-                Ok(())
-            })
+            .map(|&i| write_entry(i, &decompressed_frames))
             .collect();
 
         for r in write_results {

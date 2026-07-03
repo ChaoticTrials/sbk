@@ -7,7 +7,7 @@ use crate::classify::Group;
 use crate::codec;
 use crate::format::frame_dir::read_frame_dir;
 use crate::format::header::read_header;
-use crate::format::index::read_index;
+use crate::format::index::{read_index, validate_entries};
 
 pub fn info(archive: &Path, list: bool) -> anyhow::Result<()> {
     let mut f = File::open(archive)?;
@@ -15,7 +15,7 @@ pub fn info(archive: &Path, list: bool) -> anyhow::Result<()> {
     let codec = codec::from_algorithm(header.algorithm);
 
     f.seek(SeekFrom::Start(header.frame_dir_offset))?;
-    let frame_dir = read_frame_dir(&mut f)?;
+    let frame_dir = read_frame_dir(&mut f, header.frame_size_bytes)?;
 
     f.seek(SeekFrom::Start(header.index_offset))?;
     let entries = read_index(
@@ -24,6 +24,7 @@ pub fn info(archive: &Path, list: bool) -> anyhow::Result<()> {
         header.index_compressed_size,
         header.index_checksum,
     )?;
+    validate_entries(&entries, &frame_dir, header.frame_size_bytes)?;
 
     println!("SBK Archive: {}", archive.display());
     println!("  Format version: {}", header.format_version);
