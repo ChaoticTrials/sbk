@@ -1,6 +1,5 @@
-use std::fs::OpenOptions;
 use std::io::{Seek, SeekFrom, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use rayon::prelude::*;
@@ -18,10 +17,39 @@ use crate::preprocess::mca::preprocess_mca_from_bytes;
 use crate::preprocess::nbt::preprocess_nbt_from_bytes;
 use crate::solid::FRAME_SIZE;
 
+#[derive(Clone)]
 struct FileInfo {
     abs_path: std::path::PathBuf,
     rel_path: String,
     mtime_ms: i64,
+}
+
+/// Outcome of reading + preprocessing a single file in the parallel stage.
+enum PreprocessOutcome {
+    /// File was read and preprocessed; ready to be appended to the group stream.
+    Ready {
+        original_size: u64,
+        file_checksum: u32,
+        preprocessed: Vec<u8>,
+    },
+    /// Preprocessing failed; the file must be stored verbatim in the RAW group.
+    Deferred,
+    /// File could not be read; it is dropped from the archive.
+    Skipped,
+}
+
+/// Deletes the in-progress `.part` file on drop unless it was renamed into
+/// place (signalled by setting `path` to `None`).
+struct PartFileGuard {
+    path: Option<PathBuf>,
+}
+
+impl Drop for PartFileGuard {
+    fn drop(&mut self) {
+        if let Some(p) = &self.path {
+            let _ = std::fs::remove_file(p);
+        }
+    }
 }
 
 pub fn compress(world_dir: &Path, opts: &CompressOptions) -> anyhow::Result<()> {
@@ -72,11 +100,47 @@ where
     let mut total_scanned = 0u64;
     let mut skipped = 0u64;
 
-    for entry in WalkDir::new(world_dir)
-        .into_iter()
-        .filter_map(|e| e.ok())
-        .filter(|e| e.file_type().is_file())
-    {
+    // Resolve the output's final absolute path so a pre-existing archive inside
+    // world_dir is never included in itself. The file may not exist yet, so
+    // canonicalize its parent and re-join the file name.
+    let output_abs: Option<PathBuf> = opts.output.file_name().and_then(|name| {
+        let parent = opts
+            .output
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        parent.canonicalize().ok().map(|p| p.join(name))
+    });
+
+    for entry in WalkDir::new(world_dir) {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(e) => {
+                if !opts.quiet {
+                    let path = e
+                        .path()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_else(|| "<unknown>".to_string());
+                    eprintln!("Warning: cannot access {}: {}", path, e);
+                }
+                skipped += 1;
+                continue;
+            }
+        };
+        if entry.file_type().is_symlink() {
+            if !opts.quiet {
+                eprintln!(
+                    "Warning: skipping symlink {} (symlinks are not archived)",
+                    entry.path().display()
+                );
+            }
+            skipped += 1;
+            continue;
+        }
+        if !entry.file_type().is_file() {
+            continue;
+        }
+
         total_scanned += 1;
         let abs_path = entry.path().to_path_buf();
         let rel = abs_path
@@ -84,6 +148,23 @@ where
             .unwrap_or(&abs_path)
             .to_string_lossy()
             .replace('\\', "/");
+
+        // Never include the output archive in itself (e.g. re-running a backup
+        // whose output path lies inside the world directory).
+        if let Some(out_abs) = &output_abs {
+            if abs_path.file_name() == out_abs.file_name()
+                && abs_path.canonicalize().is_ok_and(|p| &p == out_abs)
+            {
+                if !opts.quiet {
+                    eprintln!(
+                        "Warning: skipping {} (it is the output archive)",
+                        rel
+                    );
+                }
+                skipped += 1;
+                continue;
+            }
+        }
 
         let meta = match entry.metadata() {
             Ok(m) => m,
@@ -137,11 +218,29 @@ where
     // === Pass 2: open output, write placeholder header, then stream frames ===
     // Frame directory is written AFTER all frame data so we don't need to know
     // frame counts upfront. The reader seeks to frame_dir_offset from the header.
-    let mut out = OpenOptions::new()
+    //
+    // The archive is written to a `.part` file next to the output and only
+    // renamed into place once the final header is written, so a mid-run failure
+    // never destroys a pre-existing archive at the output path. A plain file
+    // (not NamedTempFile) is used so permissions follow the umask instead of
+    // the 0600 that temp files get. The guard deletes the partial file on error.
+    let part_path = {
+        let mut name = opts
+            .output
+            .file_name()
+            .ok_or_else(|| anyhow::anyhow!("output path has no file name"))?
+            .to_os_string();
+        name.push(".part");
+        opts.output.with_file_name(name)
+    };
+    let mut part_guard = PartFileGuard {
+        path: Some(part_path.clone()),
+    };
+    let mut out = std::fs::OpenOptions::new()
         .write(true)
         .create(true)
         .truncate(true)
-        .open(&opts.output)?;
+        .open(&part_path)?;
 
     write_placeholder(&mut out)?;
     let mut current_offset: u64 = HEADER_DISK_SIZE as u64;
@@ -152,8 +251,22 @@ where
     let batch_size = opts.threads.max(1);
     let mut files_done: usize = 0;
 
+    // Files whose group-specific preprocessing fails are collected here and
+    // stored verbatim in the RAW group instead, so extraction never has to
+    // run a group-specific reconstruction on bytes that were not preprocessed.
+    let mut deferred_raw: Vec<FileInfo> = Vec::new();
+
     for g in 0..4usize {
-        let files = &files_by_group[g];
+        let files = if g == Group::Raw as usize {
+            let mut v = std::mem::take(&mut files_by_group[g]);
+            v.append(&mut deferred_raw);
+            // Re-sort so deferred files keep output byte-identical and the
+            // index deterministic regardless of thread count.
+            v.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
+            v
+        } else {
+            std::mem::take(&mut files_by_group[g])
+        };
         if files.is_empty() {
             continue;
         }
@@ -168,7 +281,7 @@ where
         let quiet = opts.quiet;
         for chunk in files.chunks(batch_size) {
             // Parallel preprocessing: read + hash + preprocess each file concurrently.
-            let results: Vec<Option<(u64, u32, Vec<u8>)>> = chunk
+            let results: Vec<PreprocessOutcome> = chunk
                 .par_iter()
                 .map(|fi| {
                     let file_bytes = match std::fs::read(&fi.abs_path) {
@@ -177,52 +290,64 @@ where
                             if !quiet {
                                 eprintln!("Warning: could not read {}: {}", fi.rel_path, e);
                             }
-                            return None;
+                            return PreprocessOutcome::Skipped;
                         }
                     };
                     let original_size = file_bytes.len() as u64;
                     let file_checksum = hash(&file_bytes);
-                    let preprocessed = match group_enum {
-                        Group::Mca => preprocess_mca_from_bytes(&file_bytes).unwrap_or_else(|e| {
-                            if !quiet {
-                                eprintln!(
-                                    "Warning: MCA preprocess failed for {}: {}",
-                                    fi.rel_path, e
-                                );
-                            }
-                            file_bytes.clone()
-                        }),
-                        Group::Nbt => preprocess_nbt_from_bytes(&file_bytes).unwrap_or_else(|e| {
-                            if !quiet {
-                                eprintln!(
-                                    "Warning: NBT preprocess failed for {}: {}",
-                                    fi.rel_path, e
-                                );
-                            }
-                            file_bytes.clone()
-                        }),
-                        Group::Json => {
-                            preprocess_json_from_bytes(&file_bytes).unwrap_or_else(|e| {
+                    let preprocessed = if group_enum == Group::Raw {
+                        file_bytes
+                    } else {
+                        // Empty files cannot survive group-specific reconstruction
+                        // (e.g. NBT re-gzips unconditionally); store them raw.
+                        if file_bytes.is_empty() {
+                            return PreprocessOutcome::Deferred;
+                        }
+                        let result = match group_enum {
+                            Group::Mca => preprocess_mca_from_bytes(&file_bytes),
+                            Group::Nbt => preprocess_nbt_from_bytes(&file_bytes),
+                            Group::Json => preprocess_json_from_bytes(&file_bytes),
+                            Group::Raw => unreachable!(),
+                        };
+                        match result {
+                            Ok(p) => p,
+                            Err(e) => {
                                 if !quiet {
                                     eprintln!(
-                                        "Warning: JSON preprocess failed for {}: {}",
-                                        fi.rel_path, e
+                                        "Warning: {:?} preprocess failed for {}: {} — storing file raw",
+                                        group_enum, fi.rel_path, e
                                     );
                                 }
-                                file_bytes.clone()
-                            })
+                                return PreprocessOutcome::Deferred;
+                            }
                         }
-                        Group::Raw => file_bytes.clone(),
                     };
-                    Some((original_size, file_checksum, preprocessed))
+                    PreprocessOutcome::Ready {
+                        original_size,
+                        file_checksum,
+                        preprocessed,
+                    }
                 })
                 .collect();
 
             // Drain results in order into the frame buffer.
-            for (fi, opt) in chunk.iter().zip(results) {
-                let Some((original_size, file_checksum, preprocessed)) = opt else {
-                    bar_pre.inc(1);
-                    continue;
+            for (fi, outcome) in chunk.iter().zip(results) {
+                let (original_size, file_checksum, preprocessed) = match outcome {
+                    PreprocessOutcome::Ready {
+                        original_size,
+                        file_checksum,
+                        preprocessed,
+                    } => (original_size, file_checksum, preprocessed),
+                    PreprocessOutcome::Deferred => {
+                        // Re-queued into the RAW group; progress is counted
+                        // when the file is actually drained there.
+                        deferred_raw.push(fi.clone());
+                        continue;
+                    }
+                    PreprocessOutcome::Skipped => {
+                        bar_pre.inc(1);
+                        continue;
+                    }
                 };
 
                 let file_stream_offset = stream_offset;
@@ -324,6 +449,13 @@ where
         index_checksum,
     };
     write_header(&mut out, &header)?;
+
+    // Atomically move the finished archive into place. Until this point a
+    // pre-existing file at the output path is untouched.
+    out.flush()?;
+    drop(out);
+    std::fs::rename(&part_path, &opts.output)?;
+    part_guard.path = None; // renamed away; nothing to clean up
 
     // === Print summary ===
     if !opts.quiet && !hide_bars {
