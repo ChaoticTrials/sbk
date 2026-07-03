@@ -41,6 +41,25 @@ mod tests {
     }
 
     #[test]
+    fn preserves_key_order() {
+        let result = preprocess_json_from_bytes(b"{\"zebra\": 1, \"alpha\": 2}").unwrap();
+        assert_eq!(result, b"{\"zebra\":1,\"alpha\":2}");
+    }
+
+    #[test]
+    fn preserves_number_text() {
+        // Digits must survive exactly, including values beyond f64 precision.
+        // (Note: serde_json normalizes an unsigned exponent, e.g. 1e5 -> 1e+5,
+        // but never alters the digits themselves.)
+        let input = b"{\"a\": 0.30000000000000004, \"b\": 3.141592653589793238462643383279, \"c\": 123456789012345678901234567890}";
+        let result = preprocess_json_from_bytes(input).unwrap();
+        assert_eq!(
+            result,
+            b"{\"a\":0.30000000000000004,\"b\":3.141592653589793238462643383279,\"c\":123456789012345678901234567890}"
+        );
+    }
+
+    #[test]
     fn invalid_json_errors() {
         assert!(preprocess_json_from_bytes(b"not json {{{").is_err());
         assert!(preprocess_json_from_bytes(b"").is_err());
