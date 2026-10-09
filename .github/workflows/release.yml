@@ -138,7 +138,7 @@ jobs:
       - name: Checkout apt-repo
         uses: actions/checkout@v4
         with:
-          repository: ChaoticTrials/apt-repo
+          repository: ChaoticTrials/package-repo
           token: ${{ secrets.APT_REPO_TOKEN }}
           path: apt-repo
 
@@ -178,12 +178,12 @@ jobs:
             -architectures=amd64,arm64 \
             -distribution=stable \
             packages \
-            filesystem:apt-repo: 2>/dev/null || \
+            filesystem:apt-repo:deb 2>/dev/null || \
           aptly publish update \
             -gpg-key=${{ secrets.GPG_KEY_ID }} \
             -passphrase="${{ secrets.GPG_PASSPHRASE }}" \
             stable \
-            filesystem:apt-repo:
+            filesystem:apt-repo:deb
 
       - name: Commit and push updated apt-repo
         working-directory: apt-repo
